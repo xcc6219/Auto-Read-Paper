@@ -143,11 +143,13 @@ High-scoring papers are **never buried**:
    | `SEND_MINUTE_BJ` | Beijing minute (0-59). Optional, default `0`. Rounded down to the nearest 5-minute bucket — GitHub cron drifts ~5-15 min so finer precision isn't realistic. | `30` |
    | `OPENAI_MODEL` | LLM model id used for both scoring and the deep-read summary. Any model your `OPENAI_API_BASE` provider serves. Default `gpt-4o-mini`. | `gpt-4o-mini`, `deepseek-chat`, `Qwen/Qwen2.5-72B-Instruct` |
    | `OPENAI_MAX_TOKENS` | Per-request output token cap. Default `4096`. **Must be ≤ your model's context window** — many OpenAI-compatible providers cap at `8192` (DeepSeek, some Qwen tiers). Setting this too high yields `400 Invalid max_tokens value`. | `4096`, `8192` |
-   | `CUSTOM_CONFIG` | The full YAML configuration (see below). | *(multi-line YAML)* |
+   | `CUSTOM_CONFIG` | The full YAML configuration (see below). **Must be edited to match your own research keywords / categories / language — not optional.** | *(multi-line YAML)* |
 
    ![custom_config](./assets/config_var.png)
 
-   Paste the following into `CUSTOM_CONFIG`, then edit `keywords` / `category` / `model` to your taste:
+   > ⚠️ **You MUST set `CUSTOM_CONFIG` yourself after forking.** GitHub does NOT copy Variables (or Secrets) from the upstream repo when you fork — on a fresh fork, `CUSTOM_CONFIG` is empty, and the workflow falls back to the committed [`config/custom.yaml`](config/custom.yaml), which ships a **generic 3-keyword template** (`reinforcement learning` / `model predictive control` / `residual policy`). **That template is NOT tailored to you** — unless your research actually matches those exact keywords, edit `keywords` / `category` / `model` / `language` in the sample below to match your own field before pasting into `CUSTOM_CONFIG`.
+
+   Paste the following into `CUSTOM_CONFIG`, then **edit `keywords` / `category` / `model` / `language` to match your own research interests**:
 
    ```yaml
    email:

@@ -12,34 +12,17 @@ llm:
   generation_kwargs:
     model: ${oc.env:OPENAI_MODEL,gpt-4o-mini}
     max_tokens: ${oc.decode:${oc.env:OPENAI_MAX_TOKENS,4096}}
+    temperature: 0.3
   language: Chinese
 
 source:
   arxiv:
-    category: ["cs.RO", "cs.AI", "cs.LG", "cs.CV", "eess.SY"]
+    category: ["cs.AI", "cs.LG", "cs.RO"]
     include_cross_list: true
     keywords:
-      - "autonomous driving"
-      - "self-driving"
-      - "end-to-end driving"
-      - "automated vehicle"
-      - "motion planning"
-      - "trajectory planning"
-      - "trajectory prediction"
-      - "behavior prediction"
-      - "driving policy"
-      - "decision making"
-      - "lane change"
-      - "vehicle control"
       - "reinforcement learning"
       - "model predictive control"
       - "residual policy"
-      - "imitation learning"
-      - "bird's eye view"
-      - "world model"
-      - "CARLA"
-      - "nuScenes"
-      - "nuPlan"
 
 executor:
   debug: ${oc.env:DEBUG,null}
