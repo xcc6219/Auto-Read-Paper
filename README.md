@@ -89,7 +89,7 @@ High-scoring papers are **never buried**:
 - ⏰ **Minute-accurate scheduling** — driven by an external cron service (free, minute-precision) instead of GitHub's best-effort cron, with a per-day idempotency marker preventing double-sends
 - 🔍 **Keyword pre-filter** — papers not matching your keywords are dropped before any LLM call (saves tokens)
 - 💰 **Free infra on public repos** — GitHub Actions minutes are unlimited for public repos; you only pay the LLM provider for tokens
-- 🫀 **Heartbeat stability** — external-scheduler trigger sidesteps GitHub's 60-day idle-schedule pause entirely; history fallback + arXiv heartbeat keeps the daily pulse alive even on quiet days
+- 🫀 **Pause-proof** — external-scheduler trigger sidesteps GitHub's 60-day idle-schedule pause entirely (no keep-alive workflow needed); history fallback + arXiv heartbeat keeps the daily pulse alive even on quiet days
 - 🔧 **Hydra + OmegaConf** — every behavior is configurable via YAML with hot env-var interpolation
 
 ---
@@ -100,6 +100,8 @@ High-scoring papers are **never buried**:
 
 1. **Fork this repo into your own GitHub account.**
    ![fork](./assets/fork.png)
+
+   > **Enable Actions on your fork.** GitHub disables workflows on all forks by default as an anti-abuse measure. After forking, open the **Actions** tab — you'll see a yellow banner *"Workflows aren't being run on this forked repository"*. Click **"I understand my workflows, go ahead and enable them"**. This is a one-time, one-click action per fork. Until you do this, neither the `Test` workflow nor `Send paper daily` can be triggered — manually *or* via cron-job.org API.
 
 2. **Set GitHub Action repository secrets.** They are invisible after saving, even to you.
 
@@ -219,12 +221,14 @@ High-scoring papers are **never buried**:
         - `Accept: application/vnd.github+json`
       - **Advanced tab → Request body:** `{"ref":"main"}`
         > Do **not** add `"inputs":{"force":true}` here. Leaving `force` at its default (false) keeps the "already sent today" guard active, so an accidental cron-job.org retry cannot double-send.
+
+      ![cron create](./assets/cron_create.png)
+      ![cron config](./assets/cron_config.png)
    3. **Save and enable.** That's it — **the cron-job.org dashboard is now the single source of truth for your send time.** To reschedule, change it there; no repo edit is ever needed.
 
    > **Need to force-resend today?** Go to GitHub **Actions → Send paper daily → Run workflow**, tick the **`force`** checkbox, and click Run. `force=true` bypasses the idempotency marker (letting you send a second time the same day for debugging) and it does **not** overwrite the day's canonical sent-marker, so a later automated run from cron-job.org — if it hasn't happened yet — will still go through normally.
 
-7. **Keep it running 365 days.** The daily send is triggered externally by cron-job.org, so GitHub's **60-day idle-schedule pause no longer affects it** — cron-job.org will keep POSTing regardless of whether this repo has recent commits. The bundled `Keep Alive` workflow is therefore no longer strictly necessary; it's left enabled as a harmless belt-and-braces (≈12 runs/year, negligible quota impact) and still protects any *other* schedule-based workflow you might add later.
-   ![keep](./assets/keep.png)
+7. **Keep it running 365 days — nothing extra to do.** Because the daily send is triggered externally by cron-job.org (not by GitHub's `schedule:`), GitHub's **60-day idle-schedule pause** simply does not apply to this repo. No heartbeat workflow, no keep-alive commits — cron-job.org will keep POSTing regardless of how quiet the repo is.
 
    > **Actions minute quota.** See the next subsection for the full breakdown. TL;DR: **public forks = unlimited and free forever**; private forks now use ~1 min/day (30 min/month), easily inside the Free plan's 2000 min/month cap.
 
@@ -240,7 +244,7 @@ Short answer: **No — both public and private forks run comfortably inside thei
 | **Public** (default when you fork) | **Unlimited & free** | Unlimited & free | ✅ 365-day operation, zero infra cost. Just keep the LLM API key funded. |
 | **Private** | 2000 min/month free (Free plan), 3000 (Pro) | 500 MB / 1 GB | ✅ ~1 min/day × 30 days ≈ **30 min/month**, well inside the 2000-min Free cap. |
 
-`Keep Alive` contributes another ~12 invocations/year (negligible). cron-job.org itself is free with no per-call limit on their free tier.
+cron-job.org itself is free with no per-call limit on their free tier.
 
 ### Full configuration reference
 
