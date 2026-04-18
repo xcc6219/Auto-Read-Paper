@@ -98,12 +98,23 @@ High-scoring papers are **never buried**:
 
 ### Quick Start
 
-1. **Fork this repo into your own GitHub account.**
-   ![fork](./assets/fork.png)
+> **8 steps, ~15 minutes** on a fresh fork. Each step is self-contained — **finish one, verify, move on**. The most common failure points are flagged with **⚠**.
 
-   > **Enable Actions on your fork.** GitHub disables workflows on all forks by default as an anti-abuse measure. After forking, open the **Actions** tab — you'll see a yellow banner *"Workflows aren't being run on this forked repository"*. Click **"I understand my workflows, go ahead and enable them"**. This is a one-time, one-click action per fork. Until you do this, neither the `Test` workflow nor `Send paper daily` can be triggered — manually *or* via cron-job.org API.
+---
 
-2. **Set GitHub Action repository secrets.** They are invisible after saving, even to you.
+#### 1️⃣ Fork the repo & enable Actions
+
+Click **Fork** on the upstream repo, pick your account as the owner, keep the default name.
+
+![fork](./assets/fork.png)
+
+> **⚠ Enable Actions on your fork — required, one-click, silent failure otherwise.**
+>
+> GitHub disables every workflow on every fork as an anti-abuse measure. Open the **Actions** tab — you'll see a yellow banner *"Workflows aren't being run on this forked repository"*. Click **"I understand my workflows, go ahead and enable them"**. Until you do, neither `Test` nor `Send paper daily` can be triggered — **manually *or* via cron-job.org API**.
+
+---
+
+#### 2️⃣ Set repository **Secrets** (sensitive values)
 
    > **About Secrets vs Variables.** GitHub Actions exposes two kinds of repo-level configuration:
    > - **Secrets** (`${{ secrets.X }}`): encrypted, masked as `***` in logs, never readable after save. Use these for **anything sensitive** — passwords, API keys, SMTP auth codes.
@@ -136,22 +147,28 @@ High-scoring papers are **never buried**:
    >
    > If SMTP auth fails (`535 authentication failed` in the workflow log), nine times out of ten the auth code is wrong, expired, or contains pasted-in spaces. Re-issue and re-paste. The `SENDER` address and `smtp_server` must both belong to the same provider — `SENDER=abc@qq.com` + `smtp_server=smtp.163.com` will not work.
 
-3. **Set GitHub Action repository variables** (Variables tab, *not* Secrets).
-   ![vars](./assets/repo_var.png)
+---
 
-   > **Where does the daily send time live?** Not here — the workflow has no built-in schedule, it only runs when an external service (cron-job.org) invokes it. Send time is set in the cron-job.org dashboard (step 5 below), so this variables table contains **no time-related knobs**.
+#### 3️⃣ Set repository **Variables** (non-sensitive config)
 
-   | Variable | Description | Example |
-   | :--- | :--- | :--- |
-   | `OPENAI_MODEL` | LLM model id used for both scoring and the deep-read summary. Any model your `OPENAI_API_BASE` provider serves. Default `gpt-4o-mini`. | `gpt-4o-mini`, `deepseek-chat`, `Qwen/Qwen2.5-72B-Instruct` |
-   | `OPENAI_MAX_TOKENS` | Per-request output token cap. Default `4096`. **Must be ≤ your model's context window** — many OpenAI-compatible providers cap at `8192` (DeepSeek, some Qwen tiers). Setting this too high yields `400 Invalid max_tokens value`. | `4096`, `8192` |
-   | `CUSTOM_CONFIG` | The full YAML configuration (see below). **Must be edited to match your own research keywords / categories / language — not optional.** | *(multi-line YAML)* |
+Same page as Secrets — just switch to the **Variables** tab.
 
-   ![custom_config](./assets/config_var.png)
+![vars](./assets/repo_var.png)
 
-   > ⚠️ **You MUST set `CUSTOM_CONFIG` yourself after forking.** GitHub does NOT copy Variables (or Secrets) from the upstream repo when you fork — on a fresh fork, `CUSTOM_CONFIG` is empty, and the workflow falls back to the committed [`config/custom.yaml`](config/custom.yaml), which ships a **generic 3-keyword template** (`reinforcement learning` / `model predictive control` / `residual policy`). **That template is NOT tailored to you** — unless your research actually matches those exact keywords, edit `keywords` / `category` / `model` / `language` in the sample below to match your own field before pasting into `CUSTOM_CONFIG`.
+> **Where does the daily send time live?** Not here — the workflow has no built-in schedule, it only runs when an external service (cron-job.org) invokes it. Send time is set in the cron-job.org dashboard (step 6️⃣ below), so this variables table contains **no time-related knobs**.
 
-   Paste the following into `CUSTOM_CONFIG`, then **edit `keywords` / `category` / `model` / `language` to match your own research interests**:
+| Variable | Description | Example |
+| :--- | :--- | :--- |
+| `OPENAI_MODEL` | LLM model id used for both scoring and the deep-read summary. Any model your `OPENAI_API_BASE` provider serves. Default `gpt-4o-mini`. | `gpt-4o-mini`, `deepseek-chat`, `Qwen/Qwen2.5-72B-Instruct` |
+| `OPENAI_MAX_TOKENS` | Per-request output token cap. Default `4096`. **Must be ≤ your model's context window** — many OpenAI-compatible providers cap at `8192` (DeepSeek, some Qwen tiers). Setting this too high yields `400 Invalid max_tokens value`. | `4096`, `8192` |
+| `CUSTOM_CONFIG` | The full YAML configuration (see below). **Must be edited to match your own research keywords / categories / language — not optional.** | *(multi-line YAML)* |
+
+![custom_config](./assets/config_var.png)
+
+> ⚠️ **You MUST set `CUSTOM_CONFIG` yourself after forking.** GitHub does NOT copy Variables (or Secrets) from the upstream repo when you fork — on a fresh fork, `CUSTOM_CONFIG` is empty, and the workflow falls back to the committed [`config/custom.yaml`](config/custom.yaml), which ships a **generic 3-keyword template** (`reinforcement learning` / `model predictive control` / `residual policy`). **That template is NOT tailored to you** — unless your research actually matches those exact keywords, edit `keywords` / `category` / `model` / `language` in the sample below to match your own field before pasting into `CUSTOM_CONFIG`.
+
+<details>
+<summary><b>📋 Click to expand the full <code>CUSTOM_CONFIG</code> YAML template</b> — paste this into the Variable value box, then edit <code>keywords</code> / <code>category</code> / <code>model</code> / <code>language</code> to match your own research.</summary>
 
    ```yaml
    email:
@@ -199,60 +216,131 @@ High-scoring papers are **never buried**:
      reranker: reader_reviewer
    ```
 
-   > `${oc.env:XXX,yyy}` resolves to environment variable `XXX`, falling back to `yyy` when unset.
+</details>
 
-4. **Run the `Test` workflow first — smoke-check that secrets/vars load and dependencies build.**
-   ![test](./assets/test.png)
+> `${oc.env:XXX,yyy}` resolves to environment variable `XXX`, falling back to `yyy` when unset.
 
-5. **Once `Test` passes, manually trigger `Send paper daily` for a live dry-run.** Check the workflow log and your inbox.
-   ![trigger](./assets/trigger.png)
+---
 
-6. **Set up daily scheduling via [cron-job.org](https://cron-job.org)** — this is how the workflow knows when to run. The repo no longer ships a `schedule:` cron (GitHub's built-in cron is best-effort and drifts 5–15 min), so until you complete this step the workflow will only run when you click *Run workflow* manually.
+#### 4️⃣ Smoke test — run the `Test` workflow
 
-   **6.1 Register a cron-job.org account.** Go to [cron-job.org](https://cron-job.org) → *Signup* → verify email → log in. It's free and requires no credit card. After logging in, open your **Account → Settings** and set the **timezone** to `Asia/Shanghai` (or whichever timezone you want your daily send time expressed in) — this is what the schedule picker interprets "every day at HH:MM" in.
+**Actions → Test → Run workflow.** This verifies your Secrets + Variables load cleanly and all dependencies build. Finishes in ~1 minute.
 
-   **6.2 Generate a GitHub Personal Access Token (PAT).** Go to **GitHub → Settings → Developer settings → [Fine-grained personal access tokens](https://github.com/settings/tokens?type=beta) → Generate new token**:
-   - **Resource owner:** yourself.
-   - **Repository access:** *Only select repositories* → pick **only your fork of `Auto-Read-Paper`** (nothing else).
-   - **Repository permissions → Actions:** set to **Read and write**. Leave everything else on *No access*.
-   - **Expiration:** 1 year (or *No expiration* if your org allows — otherwise set a calendar reminder to rotate).
-   - Click **Generate token** and copy the `github_pat_...` string. **GitHub only shows it once** — if you lose it, you'll have to generate a new one.
+![test](./assets/test.png)
 
-   **6.3 Create the cron job — click "CREATE CRONJOB" on the dashboard.**
+---
 
-   ![cron create](./assets/cron_create.png)
+#### 5️⃣ Live dry-run — manually trigger `Send paper daily`
 
-   **6.4 Fill in the Common tab** (screenshot below is exactly what it should look like):
+Once `Test` is green, fire `Send paper daily` once by hand. Check the workflow log and your inbox — if the digest email arrives, the pipeline itself is fully working and only the **schedule** remains.
 
-   ![cron config](./assets/cron_config.png)
+![trigger](./assets/trigger.png)
 
-   - **Title:** anything descriptive, e.g. `Auto-Read-Paper daily` or `Time trigger`.
-   - **URL:** `https://api.github.com/repos/<your-github-username>/Auto-Read-Paper/actions/workflows/main.yml/dispatches`
-     > **⚠ Replace `<your-github-username>`** with *your own* GitHub username — the screenshot above shows `xcc6219` (the upstream repo owner) in the red box as an example; if you leave that value in, your POST will hit someone else's repo and silently fail with a 404. If you also renamed the forked repo, update the `Auto-Read-Paper` segment to match.
-   - **Enable job:** turn ON (orange toggle).
-   - **Save responses in job history:** OFF is fine (keeps dashboard tidy).
-   - **Execution schedule → "Every day at":** pick the hour and minute you want the email to land. The right-hand "Next executions" preview should say `In this job's individual timezone (Asia/Shanghai)` — if it doesn't, go back to step 6.1 and fix the timezone. Example in the screenshot: `11:40` every day Beijing time.
+---
 
-   **6.5 Switch to the "Advanced" tab and fill in the HTTP details** (no screenshot, but just 4 fields):
-   - **Request method:** `POST`
-   - **Request headers:** add **both** of these (use *Add header* to create a second row):
-     - Header `Authorization` = `Bearer <your github_pat_... token>` (paste the token from step 6.2; keep the word `Bearer ` before it)
-     - Header `Accept` = `application/vnd.github+json`
-   - **Request body:** `{"ref":"main"}`
-     > Do **not** set `"inputs":{"force":true}` here. Leaving `force` at its default (false) keeps the *already sent today* guard active — a stray cron-job.org retry cannot double-send.
+#### 6️⃣ Automate the daily send via [cron-job.org](https://cron-job.org)
 
-   **6.6 Click *Create* at the bottom.** The new job appears on your dashboard with *enabled cronjobs: 1*. **Done.** The cron-job.org dashboard is now the single source of truth for your send time — to reschedule, edit the job there; no repo edit is ever needed.
+This is the schedule. The repo deliberately ships **no** `schedule:` cron (GitHub's built-in cron drifts 5–15 min and frequently drops fires), so until you finish this step the workflow only runs when you click *Run workflow* manually.
 
-   > **Verify it works:** on the job's detail page, click **Test run** (or *Execute now*). Within a few seconds the response panel should show `HTTP 204 No Content` — that's GitHub's signal that the workflow was dispatched successfully. Then check your GitHub repo's **Actions** tab: a new `Send paper daily` run should appear within ~10 s.
+**6.1 &nbsp; Register a cron-job.org account.**
+[cron-job.org](https://cron-job.org) → *Signup* → verify email → log in. Free, no credit card. Then **Account → Settings → Timezone** = `Asia/Shanghai` (or whatever timezone you want the "Every day at HH:MM" picker to interpret).
 
-   > **Need to force-resend today?** Go to GitHub **Actions → Send paper daily → Run workflow**, tick the **`force`** checkbox, and click Run. `force=true` bypasses the idempotency marker (letting you send a second time the same day for debugging) and it does **not** overwrite the day's canonical sent-marker, so the next automated run from cron-job.org will still go through normally.
+<br>
 
-7. **Keep it running 365 days — nothing extra to do.** Because the daily send is triggered externally by cron-job.org (not by GitHub's `schedule:`), GitHub's **60-day idle-schedule pause** simply does not apply to this repo. No heartbeat workflow, no keep-alive commits — cron-job.org will keep POSTing regardless of how quiet the repo is.
+**6.2 &nbsp; Generate a GitHub Personal Access Token (PAT).**
 
-   > **Actions minute quota.** See the next subsection for the full breakdown. TL;DR: **public forks = unlimited and free forever**; private forks now use ~1 min/day (30 min/month), easily inside the Free plan's 2000 min/month cap.
+Navigate: **GitHub avatar (top-right)** → **Settings** → **Developer settings** (left-sidebar bottom) → **Personal access tokens** → **Fine-grained tokens** → **Generate new token**.
 
-8. **(Optional) Subscribe to failure emails.** Click the repo's **Watch** button → *Custom* → tick **Actions** — GitHub will email you only when a workflow fails, so you hear about an expired API key or SMTP rejection within minutes instead of noticing a silent empty inbox days later.
-   ![subscribe](./assets/subscribe.png)
+> ⚠ **"Developer settings" lives under your *account* Settings, NOT the repo's Settings.** If you only see "Deploy keys / Secrets / Actions", you're in the wrong Settings page — go back and click the avatar in the top-right first.
+
+![developer settings](./assets/Developer_settings.png)
+
+![fine-grained tokens](./assets/Fine-grained_tokens.png)
+
+Fill the token form **exactly** like the table below — the screenshot shows a configuration with **one critical mistake flagged in red**:
+
+![no expiration](./assets/NoExpiration.png)
+
+| Field | Correct value | ⚠ Mistake to avoid |
+| :--- | :--- | :--- |
+| **Token name** | Anything, e.g. `Auto-Read-Paper dispatcher` | — |
+| **Expiration** | *No expiration* (recommended) or 1 year with a calendar reminder to rotate | — |
+| **Repository access** | **Only select repositories** → pick **only your fork** of `Auto-Read-Paper` | **❌ Do NOT pick "Public repositories"** — that grants read-only access to every public repo and **cannot dispatch workflows**. The cron POST will fail with `403 Resource not accessible`. |
+| **Repository permissions → Actions** | **Read and write** | Leave all other permissions on *No access*. |
+| **Account permissions** | *No access* (skip this whole section) | — |
+
+Click **Generate token** → copy the `github_pat_...` string **now**. GitHub shows it exactly once; losing it means regenerating.
+
+<br>
+
+**6.3 &nbsp; Create the cron job.**
+
+On the cron-job.org dashboard click **CREATE CRONJOB**.
+
+![cron create](./assets/cron_create.png)
+
+<br>
+
+**6.4 &nbsp; Fill in the "Common" tab** (screenshot below is the target state):
+
+![cron config](./assets/cron_config.png)
+
+| Field | Value |
+| :--- | :--- |
+| **Title** | Anything descriptive, e.g. `Auto-Read-Paper daily`. |
+| **URL** | `https://api.github.com/repos/<your-github-username>/Auto-Read-Paper/actions/workflows/main.yml/dispatches` <br> ⚠ **Replace `<your-github-username>` with YOUR username** — the screenshot shows `xcc6219` (the upstream owner) as an example. Leaving it unchanged POSTs to someone else's repo and silently 404s. If you also renamed your fork, update the `Auto-Read-Paper` segment. |
+| **Enable job** | ON (orange toggle). |
+| **Save responses in job history** | OFF is fine (keeps dashboard tidy). |
+| **Execution schedule → "Every day at"** | Pick the HH:MM you want the email to land. The right-hand preview must say `In this job's individual timezone (Asia/Shanghai)` — if it doesn't, fix the timezone in step 6.1. Screenshot example: `11:40` every day. |
+
+<br>
+
+**6.5 &nbsp; Switch to the "Advanced" tab** and fill the HTTP details. The screenshot below shows a configuration with **three critical mistakes flagged in red** — your values must differ from the screenshot exactly as the table says.
+
+![cron advanced](./assets/cron_advanced.png)
+
+| Field | Correct value | ⚠ Mistake to avoid |
+| :--- | :--- | :--- |
+| **Request method** | `POST` | — |
+| **Header 1 → Key** | `Authorization` | — |
+| **Header 1 → Value** | `Bearer <paste your github_pat_... token here>` | **❌ Do NOT paste just the token** — the word **`Bearer `** (with a trailing space) must come **before** the token. GitHub returns `401 Unauthorized` otherwise. |
+| **Header 2 → Key** | `Accept` | — |
+| **Header 2 → Value** | `application/vnd.github+json` | — |
+| **Request body** | `{"ref":"main"}` | **❌ Do NOT leave the body empty** — without it GitHub returns `422 Unprocessable Entity` (no `ref` specified). Do **not** add `"inputs":{"force":true}` either; that would bypass the already-sent-today guard. |
+
+<br>
+
+**6.6 &nbsp; Click *Create* at the bottom.** Done — the job appears on your dashboard with *enabled cronjobs: 1*. The cron-job.org dashboard is now the single source of truth for your send time; to reschedule, edit the job there, no repo edit needed.
+
+> **Verify it works:** open the job's detail page → click **Test run** (or *Execute now*). Within a few seconds the response panel shows the HTTP status. Expected: `204 No Content`. Then open your GitHub repo's **Actions** tab — a new `Send paper daily` run should appear within ~10 s.
+
+**Troubleshooting the test-run HTTP status:**
+
+| Status | Meaning | Fix |
+| :---: | :--- | :--- |
+| **204** | ✅ Success — workflow dispatched | Nothing to do. |
+| **401** | Unauthorized — missing/malformed token | Header value must start with `Bearer ` (with trailing space), followed by the full `github_pat_...` string. |
+| **403** | Forbidden — token lacks permission | PAT was created with *Public repositories* access. Regenerate with **Only select repositories** + **Actions: Read and write**. |
+| **404** | Not found — wrong URL | Username in URL is not your account, repo was renamed, or fork doesn't exist. |
+| **422** | Unprocessable entity — bad body | Request body must be exactly `{"ref":"main"}`. |
+
+> **Need to force-resend today?** GitHub **Actions → Send paper daily → Run workflow** → tick **`force`** → Run. `force=true` bypasses the idempotency marker (letting you send twice the same day for debugging) and does **not** overwrite the day's canonical sent-marker — the next scheduled cron-job.org run still fires normally.
+
+---
+
+#### 7️⃣ Forget about it — runs every day automatically
+
+Because scheduling is external (cron-job.org, not GitHub `schedule:`), GitHub's **60-day idle-pause** does **not** apply. No heartbeat workflow, no keep-alive commits — cron-job.org keeps POSTing regardless of how quiet the repo is.
+
+> **Actions quota?** Public forks = unlimited and free forever. Private forks use ~1 min/day (30 min/month), well inside the Free plan's 2000 min/month cap. Full table in [⚖️ Will this burn through my GitHub Actions quota?](#️-will-this-burn-through-my-github-actions-quota) below.
+
+---
+
+#### 8️⃣ (Optional) Subscribe to failure emails
+
+Click the repo's **Watch** → *Custom* → tick **Actions**. GitHub will email you **only** when a workflow fails, so you catch an expired API key or SMTP rejection within minutes instead of noticing a silent empty inbox days later.
+
+![subscribe](./assets/subscribe.png)
 
 ### ⚖️ Will this burn through my GitHub Actions quota?
 
