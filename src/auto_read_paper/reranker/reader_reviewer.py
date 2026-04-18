@@ -35,7 +35,7 @@ REVIEWER_SYSTEM_PROMPT = (
     "You are a senior research reviewer. Given structured notes for several papers, "
     "rank them by overall value to a researcher with the stated keywords. "
     "Evaluate each paper holistically on all of the following dimensions, and "
-    "fold them into a single 0-10 score:\n"
+    "fold them into a single score:\n"
     "  • soundness — is the motivation well-posed, the method rigorous?\n"
     "  • novelty — genuinely new idea vs. incremental tweak?\n"
     "  • effectiveness — do reported results support the claims?\n"
@@ -46,8 +46,18 @@ REVIEWER_SYSTEM_PROMPT = (
     "NOT score near the top; likewise a thorough but routine paper should not beat a "
     "novel and sound one. Calibrate globally — the best paper in the batch anchors "
     "the top of the scale; the weakest anchors the bottom.\n"
+    "\n"
+    "SCORING SCALE — READ CAREFULLY:\n"
+    "  • The score is on a 0-10 INTEGER scale (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10).\n"
+    "  • It is NOT a 0-1 probability. Do NOT return values like 0.8 or 0.95.\n"
+    "  • Use the FULL range: a mediocre paper should get ~5, a strong one ~8, an "
+    "    outstanding one 9-10, a weak one 2-4. Do NOT collapse every paper to the "
+    "    same number — discriminate between them.\n"
+    "  • If the batch is homogeneous, still produce at least 2-3 distinct integers "
+    "    across papers so the caller can rank them.\n"
+    "\n"
     "Return ONLY a compact JSON object: "
-    '{"rankings": [{"id": <int>, "score": <float 0-10>, "reason": "<one sentence covering the strongest and weakest dimensions>"}, ...]} '
+    '{"rankings": [{"id": <int>, "score": <integer 0-10>, "reason": "<one sentence covering the strongest and weakest dimensions>"}, ...]} '
     "ordered from best to worst. Include EVERY paper id you were given."
 )
 
@@ -203,10 +213,40 @@ class ReaderReviewerReranker(BaseReranker):
             lines.append("")
         lines.append(
             "Return JSON only: "
-            '{"rankings": [{"id": <int>, "score": <float 0-10>, "reason": "..."}, ...]} '
-            "ordered best-first, including every id above."
+            '{"rankings": [{"id": <int>, "score": <integer 0-10>, "reason": "..."}, ...]} '
+            "ordered best-first, including every id above. "
+            "Score is an INTEGER from 0 to 10 (NOT a 0-1 probability). "
+            "Use the full range and discriminate — do NOT give every paper the same score."
         )
         return "\n".join(lines)
+
+    def _call_reviewer(self, prompt: str, extra_system: str = "") -> str:
+        system = REVIEWER_SYSTEM_PROMPT + (("\n\n" + extra_system) if extra_system else "")
+        resp = self.client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            **self.model_kwargs,
+        )
+        return resp.choices[0].message.content or ""
+
+    @staticmethod
+    def _is_collapsed(rankings: list[dict]) -> bool:
+        """True iff the Reviewer failed to discriminate.
+
+        Catches two common failure modes that both surface as "Relevance 1.0
+        everywhere" in the email: (a) every score identical (no ranking
+        signal), and (b) every score in [0, 1] with no rescue possible
+        upstream (e.g. [0.0, 0.0, 1.0] — the parser's scale-rescue only
+        rescales when the WHOLE batch is <=1, which triggers here too).
+        """
+        if not rankings or len(rankings) < 2:
+            return False
+        scores = [r["score"] for r in rankings]
+        if max(scores) - min(scores) < 0.5:
+            return True
+        return False
 
     def _review_batch(self, paper_notes: list[tuple[int, Paper, dict]]) -> list[dict] | None:
         if not paper_notes:
@@ -214,20 +254,46 @@ class ReaderReviewerReranker(BaseReranker):
         expected_ids = {pid for pid, _, _ in paper_notes}
         prompt = self._build_reviewer_prompt(paper_notes)
         try:
-            resp = self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                **self.model_kwargs,
-            )
-            content = resp.choices[0].message.content or ""
+            content = self._call_reviewer(prompt)
         except Exception as e:
             logger.warning(f"Reviewer batch failed: {e}")
             return None
         rankings = _parse_reviewer_json(content, expected_ids)
         if rankings is None:
             logger.warning(f"Unparseable Reviewer output: {content[:300]}")
+            return None
+
+        # Second-chance retry when the Reviewer returns a collapsed ranking
+        # (every paper ~identical). Some smaller models do this on their
+        # first pass; a sterner system-message + an explicit reminder to
+        # discriminate fixes it ~80% of the time in practice.
+        if self._is_collapsed(rankings):
+            logger.warning(
+                f"Reviewer output is collapsed (scores: "
+                f"{[r['score'] for r in rankings]}) — retrying once with a "
+                f"stricter reminder to use the full 0-10 range."
+            )
+            stricter = (
+                "CRITICAL: your previous answer gave every paper the same score. "
+                "That is not a ranking. This time, you MUST use at least 3 "
+                "distinct integer scores across the batch — e.g. a weak paper "
+                "gets 3, a routine paper 5, a strong paper 8. Never cluster "
+                "all papers around a single value."
+            )
+            try:
+                content2 = self._call_reviewer(prompt, extra_system=stricter)
+            except Exception as e:
+                logger.warning(f"Reviewer retry failed: {e} — keeping first-pass rankings")
+                return rankings
+            rankings2 = _parse_reviewer_json(content2, expected_ids)
+            if rankings2 is not None and not self._is_collapsed(rankings2):
+                logger.info("Reviewer retry succeeded — using retried rankings.")
+                return rankings2
+            logger.warning(
+                "Reviewer retry still collapsed — keeping first-pass rankings. "
+                "Consider switching to a stronger model (gpt-4o-mini, "
+                "deepseek-chat, Qwen2.5-72B) if this persists."
+            )
         return rankings
 
     def rerank(self, candidates: list[Paper], corpus: list[CorpusPaper]) -> list[Paper]:
@@ -316,6 +382,18 @@ class ReaderReviewerReranker(BaseReranker):
             if (paper.score or 0.0) >= self.threshold:
                 results.append(paper)
 
+        # Score audit log at INFO level so users can SEE whether the scorer
+        # actually discriminated without needing to flip on DEBUG. Catches
+        # the "every paper shows Relevance 1.0" symptom immediately.
+        if results:
+            score_preview = ", ".join(
+                f"{p.score:.1f}" for p in results[: min(10, len(results))]
+            )
+            uniq = len({round(p.score or 0.0, 1) for p in results})
+            logger.info(
+                f"Reranker scores (top {min(10, len(results))}): [{score_preview}] "
+                f"| {uniq} distinct value(s) across {len(results)} paper(s)"
+            )
         logger.info(
             f"Reranked: {len(results)} papers passed threshold {self.threshold}"
         )

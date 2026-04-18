@@ -204,6 +204,17 @@ class KeywordLLMReranker(BaseReranker):
 
         results = [p for p in results if (p.score or 0.0) >= self.threshold]
         results.sort(key=lambda x: x.score or 0.0, reverse=True)
+
+        # Score audit log so users can SEE whether the scorer discriminated.
+        if results:
+            score_preview = ", ".join(
+                f"{p.score:.1f}" for p in results[: min(10, len(results))]
+            )
+            uniq = len({round(p.score or 0.0, 1) for p in results})
+            logger.info(
+                f"Reranker scores (top {min(10, len(results))}): [{score_preview}] "
+                f"| {uniq} distinct value(s) across {len(results)} paper(s)"
+            )
         logger.info(
             f"Reranked: {len(results)} papers passed threshold {self.threshold}"
         )

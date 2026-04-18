@@ -100,6 +100,25 @@ class ScoreHistory:
             logger.warning(f"Failed to load history {self.path}: {e}; starting fresh")
             self.entries = []
             self.last_sent_email = {}
+            return
+
+        # Heal legacy cache pollution: pre-fix runs may have persisted scores
+        # on a 0-1 scale (LLM misread the 0-10 rubric) or as raw keyword-hit
+        # counts (Reviewer-fallback). Both surface in the email as every
+        # paper showing "Relevance 1.0". If EVERY scored entry sits in
+        # [0, 1] (and we have >=2 to distinguish from "genuinely low"),
+        # rescale x10 in place so the merged candidate pool mixes cleanly
+        # with freshly-scored papers under the fixed rerankers.
+        scored = [e for e in self.entries if isinstance(e.get("score"), (int, float))]
+        if len(scored) >= 2 and all(float(e["score"]) <= 1.0 for e in scored):
+            logger.warning(
+                f"History heal: every one of {len(scored)} persisted scores "
+                f"sits in [0, 1] — this is stale pollution from a pre-fix "
+                f"run (you were seeing 'Relevance 1.0' everywhere). "
+                f"Rescaling x10 in place."
+            )
+            for e in scored:
+                e["score"] = round(float(e["score"]) * 10.0, 2)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
