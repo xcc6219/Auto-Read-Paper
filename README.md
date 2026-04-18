@@ -86,7 +86,7 @@ High-scoring papers are **never buried**:
 - 🌐 **Localized AI commentary** — three-section structured summary in the language you choose (`llm.language`); technical acronyms preserved
 - 📑 **Smart bilingual titles** — English + translation in `llm.language`; automatically collapses to single-line English when language is set to English
 - 🎨 **Beautiful email template** — colored tags, card layout, score badges
-- ⏰ **Minute-accurate scheduling** — driven by an external cron service (free, minute-precision) instead of GitHub's best-effort cron, with a per-day idempotency marker preventing double-sends
+- ⏰ **Minute-accurate scheduling** — driven by an external cron service (free, minute-precision) instead of GitHub's best-effort cron; re-triggerable at any time for debugging via the scheduler's "Test run" button
 - 🔍 **Keyword pre-filter** — papers not matching your keywords are dropped before any LLM call (saves tokens)
 - 💰 **Free infra on public repos** — GitHub Actions minutes are unlimited for public repos; you only pay the LLM provider for tokens
 - 🫀 **Pause-proof** — external-scheduler trigger sidesteps GitHub's 60-day idle-schedule pause entirely (no keep-alive workflow needed); history fallback + arXiv heartbeat keeps the daily pulse alive even on quiet days
@@ -280,7 +280,7 @@ On the cron-job.org dashboard click **CREATE CRONJOB**.
 | **Header 1 → Value** | `application/vnd.github+json` |
 | **Header 2 → Key** | `Authorization` |
 | **Header 2 → Value** | ⏳ **Leave blank for now.** You'll paste `Bearer <token>` here in step 6.6. |
-| **Request body** | `{"ref":"main"}` <br> ⚠ Do **not** leave the body empty — GitHub returns `422 Unprocessable Entity` without it. Do **not** add `"inputs":{"force":true}` either; that would bypass the already-sent-today guard. |
+| **Request body** | `{"ref":"main"}` <br> ⚠ Do **not** leave the body empty — GitHub returns `422 Unprocessable Entity` without it. |
 
 > ⚠ **DO NOT close or navigate away from this cron-job.org tab.** In the next step you'll open GitHub in a **new browser tab** to generate the PAT, then come back to this exact form to paste the token. If you close this tab, all values above are lost.
 
@@ -344,7 +344,7 @@ On the job's detail page click **Test run** (or *Execute now*). Within a few sec
 | **404** | Not found — wrong URL | Username in URL is not your account, repo was renamed, or fork doesn't exist. |
 | **422** | Unprocessable entity — bad body | Request body must be exactly `{"ref":"main"}`. |
 
-> **Need to force-resend today?** GitHub **Actions → Send paper daily → Run workflow** → tick **`force`** → Run. `force=true` bypasses the idempotency marker (letting you send twice the same day for debugging) and does **not** overwrite the day's canonical sent-marker — the next scheduled cron-job.org run still fires normally.
+> **Want to re-send for testing?** No special flag needed — every trigger runs the pipeline end-to-end. On cron-job.org click **Test run** (or edit the job's schedule to any near-future time); on GitHub click **Actions → Send paper daily → Run workflow**. Both send a fresh digest immediately.
 
 ---
 

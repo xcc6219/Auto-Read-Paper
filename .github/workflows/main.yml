@@ -1,62 +1,28 @@
 name: Send paper daily
 # Trigger is external-only: invoke this workflow via cron-job.org (or any
 # minute-accurate scheduler) hitting the GitHub workflow_dispatch API at the
-# exact Beijing time you want the email sent. See README step 5 for setup.
+# exact Beijing time you want the email sent. See README step 6 for setup.
 #
 # GitHub's built-in `schedule:` cron is intentionally NOT used — it drifts
-# 5-15 min and frequently drops fires in low-traffic windows, which was the
-# original reason this project is hard to get to send at a precise time.
+# 5-15 min and frequently drops fires in low-traffic windows.
+#
+# No idempotency guard, no force input, no day-marker — every trigger runs
+# the pipeline end-to-end. cron-job.org doesn't retry by default, so
+# double-sends are not a real concern in practice. Freedom to re-trigger
+# for debugging via cron-job.org's "Test run" button is worth more than
+# defending against a scenario that doesn't happen.
+
 on:
   workflow_dispatch:
-    inputs:
-      force:
-        description: "Force send even if today's digest was already sent (bypasses the idempotency marker). Leave unchecked for normal runs — external schedulers like cron-job.org should NOT set this."
-        type: boolean
-        default: false
 
 jobs:
   send-digest:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve Beijing date
-        id: bj_date
-        run: |
-          echo "value=$(TZ=Asia/Shanghai date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
-
-      # Idempotency guard: if today's Beijing-date marker already exists in
-      # the Actions cache, a prior run already sent today's digest. Skip
-      # without running the pipeline again. This protects against:
-      #   - cron-job.org double-firing (rare glitches, retries)
-      #   - user manually re-clicking Run workflow on the same day
-      # Bypassed when inputs.force=true.
-      - name: Check if already sent today
-        id: sent_check
-        if: inputs.force != true
-        uses: actions/cache/restore@v4
-        with:
-          path: state/.sent-marker
-          key: sent-marker-${{ steps.bj_date.outputs.value }}
-          lookup-only: true
-
-      - name: Decide whether to run
-        id: decide
-        run: |
-          if [ "${{ inputs.force }}" = "true" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Forced run (force=true) — bypassing idempotency check"
-          elif [ "${{ steps.sent_check.outputs.cache-hit }}" = "true" ]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping — already sent for Beijing date ${{ steps.bj_date.outputs.value }}. Re-run with force=true to override."
-          else
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Checkout
-        if: steps.decide.outputs.run == 'true'
         uses: actions/checkout@v6
 
       - name: Setup uv
-        if: steps.decide.outputs.run == 'true'
         uses: astral-sh/setup-uv@v7
 
       # Rolling score history is persisted per-fork via actions/cache, not
@@ -64,7 +30,6 @@ jobs:
       # never leaks its scored papers to downstream forks) and avoids bloating
       # the repo with one commit per run.
       - name: Restore rolling score history
-        if: steps.decide.outputs.run == 'true'
         uses: actions/cache/restore@v4
         with:
           path: state/score_history.json
@@ -73,7 +38,6 @@ jobs:
             score-history-
 
       - name: Run script
-        if: steps.decide.outputs.run == 'true'
         env:
           SENDER: ${{ secrets.SENDER }}
           RECEIVER: ${{ secrets.RECEIVER }}
@@ -105,26 +69,8 @@ jobs:
           uv run src/auto_read_paper/main.py
 
       - name: Save rolling score history
-        if: steps.decide.outputs.run == 'true' && success()
+        if: success()
         uses: actions/cache/save@v4
         with:
           path: state/score_history.json
           key: score-history-${{ github.run_id }}
-
-      # Mark today's Beijing date as sent so any later trigger on the same
-      # day short-circuits at the idempotency guard above. Skipped when
-      # force=true — a forced run is ad-hoc (debugging / manual resend) and
-      # must NOT overwrite the day's canonical send state.
-      - name: Write sent marker
-        if: steps.decide.outputs.run == 'true' && success() && inputs.force != true
-        run: |
-          mkdir -p state
-          TZ=Asia/Shanghai date --iso-8601=seconds > state/.sent-marker
-          echo "Wrote state/.sent-marker for Beijing date ${{ steps.bj_date.outputs.value }}"
-
-      - name: Save sent marker
-        if: steps.decide.outputs.run == 'true' && success() && inputs.force != true
-        uses: actions/cache/save@v4
-        with:
-          path: state/.sent-marker
-          key: sent-marker-${{ steps.bj_date.outputs.value }}
