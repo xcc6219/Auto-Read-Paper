@@ -327,6 +327,64 @@ class ArxivRetriever(BaseRetriever):
                 logger.warning(f"Skipping fallback paper {getattr(r, 'title', r)}: {exc}")
         return papers
 
+    def search_by_keywords(
+        self,
+        keywords: list[str],
+        *,
+        days: int = 7,
+        limit: int = 20,
+    ) -> list[Paper]:
+        """Active arXiv search using an explicit keyword list (typically
+        LLM-expanded). Used by the spillover fill when today's RSS didn't
+        produce enough matches: we go back to the arXiv query API with the
+        broadened keyword set, restricted to the user's configured categories
+        and the last ``days`` days, so the email can still hit max_paper_num
+        without drifting off-topic."""
+        if not keywords or limit <= 0:
+            return []
+        client = arxiv.Client(num_retries=5, delay_seconds=5)
+        categories = list(self.config.source.arxiv.category)
+        cat_clause = " OR ".join(f"cat:{c}" for c in categories)
+        # ti:"kw" OR abs:"kw" for each keyword; arXiv's query parser tolerates
+        # quoted multi-word phrases. Cap at 20 keywords to keep the URL sane.
+        kw_clauses = [
+            f'ti:"{kw}" OR abs:"{kw}"'
+            for kw in keywords[:20]
+            if kw and kw.strip()
+        ]
+        if not kw_clauses:
+            return []
+        query = f"({cat_clause}) AND ({' OR '.join(kw_clauses)})"
+        search = arxiv.Search(
+            query=query,
+            max_results=max(limit * 4, 40),
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
+        )
+        try:
+            raws = list(client.results(search))
+        except Exception as exc:
+            logger.warning(f"Keyword-search arXiv query failed: {exc}")
+            return []
+
+        if raws:
+            from datetime import timedelta
+            cutoff = raws[0].published - timedelta(days=days)
+            raws = [r for r in raws if r.published >= cutoff]
+        raws = raws[:limit]
+        logger.info(
+            f"Keyword-search retrieval: {len(raws)} paper(s) from last {days}d "
+            f"matching {len(kw_clauses)} expanded keyword(s)"
+        )
+
+        papers: list[Paper] = []
+        for r in raws:
+            try:
+                papers.append(self.convert_to_paper(r))
+            except Exception as exc:
+                logger.warning(f"Skipping search paper {getattr(r, 'title', r)}: {exc}")
+        return papers
+
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
         authors = [a.name for a in raw_paper.authors]

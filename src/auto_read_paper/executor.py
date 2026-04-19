@@ -135,55 +135,87 @@ class Executor:
 
         # Spillover fill: if the keyword-matched pool doesn't reach max_n,
         # ask the LLM to broaden the keyword set (synonyms, abbreviations,
-        # adjacent subtopics), filter today's keyword-rejected papers with
-        # the expanded set, and rescore whatever matches. This keeps the
-        # email topically relevant — we never surface arbitrary off-topic
-        # papers just to hit max_n. Already-sent and already-scored papers
-        # are excluded so we don't re-surface old content.
-        if len(top_papers) < max_n and spillover_today and keywords:
+        # adjacent subtopics), then actively query arXiv with the expanded
+        # keywords to pull in topically-related papers we didn't see in
+        # today's RSS. We also re-filter today's keyword-rejected papers
+        # against the expanded set as a cheap bonus. Already-scored and
+        # already-sent papers are excluded so nothing re-surfaces.
+        if len(top_papers) < max_n and keywords:
             already_scored = self.history.existing_ids() if self.history is not None else set()
             sent_ids = (
                 {e.get("id") for e in self.history.entries if e.get("sent_at")}
                 if self.history is not None
                 else set()
             )
-            fresh_spill = [
-                p for p in spillover_today
-                if _paper_id(p) not in already_scored and _paper_id(p) not in sent_ids
-            ]
-            if fresh_spill:
-                logger.info(
-                    f"Pool short ({len(top_papers)}/{max_n}) — expanding keywords "
-                    f"via LLM to rescue topically-related spillover papers"
-                )
-                expanded = _expand_keywords(self.llm, keywords)
-                if expanded:
-                    logger.info(f"LLM-expanded keywords: {expanded}")
-                    combined = keywords + expanded
-                    matched_spill = [
-                        p for p in fresh_spill if count_keyword_hits(p, combined) > 0
-                    ]
-                    logger.info(
-                        f"Spillover filter (expanded keywords): "
-                        f"{len(matched_spill)}/{len(fresh_spill)} papers kept"
-                    )
-                else:
-                    matched_spill = []
-                    logger.warning(
-                        "Keyword expansion produced no usable terms — leaving pool short "
-                        "rather than injecting off-topic papers."
-                    )
+            logger.info(
+                f"Pool short ({len(top_papers)}/{max_n}) — expanding keywords "
+                f"via LLM and actively searching arXiv for related papers"
+            )
+            expanded = _expand_keywords(self.llm, keywords)
+            if expanded:
+                logger.info(f"LLM-expanded keywords: {expanded}")
+                combined = keywords + expanded
+
+                fill_candidates: list = []
+
+                # (a) re-filter today's keyword-rejected papers against the expanded set
+                fresh_spill = [
+                    p for p in spillover_today
+                    if _paper_id(p) not in already_scored and _paper_id(p) not in sent_ids
+                ]
+                matched_spill = [
+                    p for p in fresh_spill if count_keyword_hits(p, combined) > 0
+                ]
                 if matched_spill:
-                    scored_spill = self.reranker.rerank(
-                        matched_spill, [], skip_keyword_filter=True
+                    logger.info(
+                        f"Spillover from today's retrieval: {len(matched_spill)} "
+                        f"paper(s) match expanded keywords"
+                    )
+                    fill_candidates.extend(matched_spill)
+
+                # (b) actively search arXiv with the expanded keywords
+                arxiv_retriever = self.retrievers.get("arxiv")
+                if arxiv_retriever is not None and hasattr(arxiv_retriever, "search_by_keywords"):
+                    try:
+                        searched = arxiv_retriever.search_by_keywords(
+                            combined,
+                            days=7,
+                            limit=max(max_n * 2, 20),
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Keyword-search fallback failed: {exc}")
+                        searched = []
+                    searched = [
+                        p for p in searched
+                        if _paper_id(p) not in already_scored
+                        and _paper_id(p) not in sent_ids
+                    ]
+                    # dedup against the spillover we already added
+                    seen_ids = {_paper_id(p) for p in fill_candidates}
+                    searched = [p for p in searched if _paper_id(p) not in seen_ids]
+                    if searched:
+                        logger.info(
+                            f"Active arXiv keyword-search yielded {len(searched)} "
+                            f"additional paper(s)"
+                        )
+                        fill_candidates.extend(searched)
+
+                if fill_candidates:
+                    scored_fill = self.reranker.rerank(
+                        fill_candidates, [], skip_keyword_filter=True
                     )
                     if self.history is not None:
-                        self.history.record_newly_scored(scored_spill, today)
+                        self.history.record_newly_scored(scored_fill, today)
                         pool = self.history.unsent_papers()
                     else:
-                        pool = pool + list(scored_spill)
+                        pool = pool + list(scored_fill)
                     pool.sort(key=lambda p: p.score or 0.0, reverse=True)
                     top_papers = pool[:max_n]
+            else:
+                logger.warning(
+                    "Keyword expansion produced no usable terms — leaving pool short "
+                    "rather than injecting off-topic papers."
+                )
 
         # Last-resort heartbeat: if even the unsent pool is empty (first run,
         # very quiet day, or the user already consumed everything in previous
