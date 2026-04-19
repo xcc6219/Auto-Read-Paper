@@ -87,10 +87,17 @@ class Executor:
         # unsent/fresh papers, pad with previously-sent entries from history
         # (highest-scoring first). This guarantees the pipeline produces a
         # visible heartbeat every day even on quiet days.
+        #
+        # Critical for multi-push-per-day users: we EXCLUDE papers sent today
+        # so the 2nd/3rd trigger within the same calendar day rotates to
+        # different historical papers. Without this, each same-day trigger
+        # would refill with exactly the batch we just sent → identical
+        # content hash → dedup short-circuits the SMTP call and the user
+        # never receives the second email.
         if len(top_papers) < max_n and self.history is not None:
             already_ids = {getattr(p, "url", None) for p in top_papers}
             filler_pool = [
-                p for p in self.history.sent_papers()
+                p for p in self.history.sent_papers(exclude_sent_on=today)
                 if getattr(p, "url", None) not in already_ids
             ]
             filler_pool.sort(key=lambda p: p.score or 0.0, reverse=True)
