@@ -27,6 +27,11 @@ concurrency:
 jobs:
   send-digest:
     runs-on: ubuntu-latest
+    # actions:write lets the job delete its own previous cache entry before
+    # re-saving under the same key. Without it, `gh cache delete` 403s.
+    permissions:
+      contents: read
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -38,13 +43,16 @@ jobs:
       # committed to git. This keeps each fork's state fully isolated (upstream
       # never leaks its scored papers to downstream forks) and avoids bloating
       # the repo with one commit per run.
+      #
+      # Stable key (no run_id) so we keep exactly ONE cache entry instead of
+      # accumulating one per run. GitHub refuses to overwrite an existing key,
+      # so the "Delete previous cache" step below clears the old entry before
+      # save re-creates it with fresh state.
       - name: Restore rolling score history
         uses: actions/cache/restore@v5
         with:
           path: state/score_history.json
-          key: score-history-${{ github.run_id }}
-          restore-keys: |
-            score-history-
+          key: score-history-v1
 
       - name: Run script
         env:
@@ -83,9 +91,20 @@ jobs:
       # but if the runner is killed between SMTP and this step, anything that
       # actually shipped must still be persisted as sent — otherwise the next
       # run would re-pick the same papers from the unsent pool.
+      #
+      # actions/cache/save refuses to overwrite an existing key, so delete
+      # the old entry first. `continue-on-error: true` handles the first-ever
+      # run (nothing to delete yet) gracefully.
+      - name: Delete previous cache entry
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh cache delete score-history-v1 --repo "$GITHUB_REPOSITORY"
+
       - name: Save rolling score history
         if: always()
         uses: actions/cache/save@v5
         with:
           path: state/score_history.json
-          key: score-history-${{ github.run_id }}
+          key: score-history-v1
