@@ -216,6 +216,8 @@ Same page as Secrets — just switch to the **Variables** tab.
 
 > `${oc.env:XXX,yyy}` resolves to environment variable `XXX`, falling back to `yyy` when unset.
 
+> **Upgrading from an older `CUSTOM_CONFIG`?** The workflow now sanitizes `CUSTOM_CONFIG` and only allows the documented `${oc.env:VAR}` / `${oc.env:VAR,default}` interpolations. If you see a job log line like `sanitize: refusing unsafe interpolation '${oc.decode:...}' at 'root.llm.generation_kwargs.max_tokens'`, your variable still has the legacy nested form. Replace the whole `llm` block with the template above (note: `max_tokens: ${oc.env:LLM_MAX_TOKENS,4096}` — no `oc.decode`, no `generation_kwargs` wrapper).
+
 ---
 
 #### 4️⃣ Smoke test — run the `Test` workflow
