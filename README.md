@@ -130,7 +130,24 @@ Click **Fork** on the upstream repo, pick your account as the owner, keep the de
    | `SENDER_PASSWORD` | **SMTP auth code for `SENDER`** — a special password issued by the email provider for third-party SMTP clients. **NOT your webmail login password.** See "SMTP auth code how-to" below. | `abcdefghijklmn` |
    | `RECEIVER` | **The email account that RECEIVES the digest** (inbox). Can be any address, same provider or different, no SMTP setup needed. | `abc@outlook.com` |
    | `LLM_API_KEY` | **Unified** API key for your LLM provider — OpenAI, Anthropic, Gemini, DeepSeek, Qwen, Kimi, MiniMax, Ollama, vLLM, OpenRouter, Groq, SiliconFlow, … all share this single secret. No provider-specific `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` needed. **Pre-rename forks**: legacy `OPENAI_API_KEY` is still honored as a fallback (with a workflow-log deprecation warning). | `sk-xxx`, `sk-ant-xxx`, `AIza…` |
-   | `LLM_API_BASE` | **Unified** base URL. Leave empty for native providers (`openai/…`, `anthropic/…`, `gemini/…`, `groq/…`) — LiteLLM uses each vendor's official endpoint. Set it for OpenAI-compatible third-parties (DeepSeek, Qwen, Kimi, Ollama, vLLM, …). **Pre-rename forks**: legacy `OPENAI_API_BASE` is still honored as a fallback. | `https://api.deepseek.com/v1`, `http://127.0.0.1:11434/v1` |
+   | `LLM_API_BASE` | **Unified** base URL. Leave empty for native providers (`openai/…`, `anthropic/…`, `gemini/…`, `groq/…`) — LiteLLM uses each vendor's official endpoint. Set it for OpenAI-compatible third-parties (DeepSeek, Qwen, Kimi, Ollama, vLLM, …). **Pre-rename forks**: legacy `OPENAI_API_BASE` is still honored as a fallback. | `https://api.minimaxi.com/v1`, `https://api.deepseek.com/v1` |
+
+   <details>
+   <summary><b>📋 Never registered an LLM API before? Click here for a step-by-step MiniMax signup tutorial</b> — MiniMax offers free-tier credits and works out-of-the-box with this project.</summary>
+
+   > If you've never used an LLM API provider, **MiniMax** is one of the easiest starting points — signup is quick, the free tier is generous enough to run this project daily, and it's OpenAI-compatible so no extra setup is needed.
+   >
+   > 1. **Register** — open [https://platform.minimaxi.com/](https://platform.minimaxi.com/) and sign up with your phone number or email. Verify the account.
+   > 2. **Create an API key** — after login, go to **账户管理 → API密钥管理 (Account → API Keys)** → click **新建密钥 (Create Key)** → give it a name → copy the generated `sk-...` string immediately (you won't be able to see it again).
+   > 3. **Paste it into GitHub** — in your fork's **Settings → Secrets and variables → Actions → Secrets** tab, set:
+   >    - `LLM_API_KEY` = the `sk-...` string you just copied
+   >    - `LLM_API_BASE` = `https://api.minimaxi.com/v1`
+   > 4. **Pick a model** — in the **Variables** tab, set `LLM_MODEL` to a MiniMax model id, e.g. `MiniMax-M2.7`. (See the model list below for alternatives.)
+   > 5. **Top up if needed** — the free tier usually covers weeks of daily digests. If you hit a quota error, go to **账户管理 → 充值 (Recharge)** and add a few RMB.
+   >
+   > Other beginner-friendly providers with similar flows: **DeepSeek** (`https://platform.deepseek.com/`), **Kimi / Moonshot** (`https://platform.moonshot.cn/`), **Qwen / DashScope** (`https://dashscope.console.aliyun.com/`). All are OpenAI-compatible — just swap the `LLM_API_BASE` and `LLM_MODEL` accordingly.
+
+   </details>
 
    > **Quick mental model** — there are three email-related values, don't mix them up:
    > - `SENDER` = **outbox address** (sends the mail). Needs a matching `SENDER_PASSWORD` auth code **and** a matching `smtp_server` / `smtp_port` in the YAML config below.
@@ -159,7 +176,7 @@ Same page as Secrets — just switch to the **Variables** tab.
 
 | Variable | Description | Example |
 | :--- | :--- | :--- |
-| `LLM_MODEL` | LiteLLM-style model id used for both scoring and the deep-read summary. See the [provider matrix](#-use-a-different-llm-provider) below. Default `gpt-4o-mini`. **Pre-rename forks**: legacy `OPENAI_MODEL` is still honored as a fallback. | `openai/gpt-4o-mini`, `anthropic/claude-sonnet-4-6`, `gemini/gemini-2.0-flash`, `deepseek/deepseek-chat`, `openai/o3-mini` |
+| `LLM_MODEL` | LiteLLM-style model id used for both scoring and the deep-read summary. See the [provider matrix](#-use-a-different-llm-provider) below. Default `gpt-4o-mini`. **Pre-rename forks**: legacy `OPENAI_MODEL` is still honored as a fallback. | `MiniMax-M2.7`, `openai/gpt-4o-mini`, `anthropic/claude-sonnet-4-6`, `gemini/gemini-2.0-flash`, `deepseek/deepseek-chat` |
 | `LLM_MAX_TOKENS` | Per-request output token cap. Default `4096`. Auto-renamed to `max_completion_tokens` for reasoning models (`o1`/`o3`/`o4`/`gpt-5`). **Must be ≤ your model's context window.** **Pre-rename forks**: legacy `OPENAI_MAX_TOKENS` is still honored. | `4096`, `8192` |
 | `CUSTOM_CONFIG` | The full YAML configuration (see below). **Must be edited to match your own research keywords / categories / language — not optional.** | *(multi-line YAML)* |
 
