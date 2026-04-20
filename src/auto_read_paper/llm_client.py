@@ -41,16 +41,62 @@ _JSON_MODE_PROVIDER_PREFIXES = (
     "vertex_ai/",
 )
 
-# Model-name patterns that require OpenAI's reasoning-model param shape:
-# max_tokens -> max_completion_tokens, and no temperature/top_p.
+# Model-name patterns that require the reasoning-model param shape:
+# max_tokens -> max_completion_tokens, and no temperature/top_p. Covers
+# OpenAI o-series / gpt-5, Moonshot Kimi thinking, DeepSeek-R1, Qwen QwQ,
+# and any provider that puts "-thinking" / "-reasoning" in the model name.
 _REASONING_MODEL_RE = re.compile(
-    r"^(openai/)?(o\d[-_]?|gpt-5)",
+    r"^(?:[\w.-]+/)?("
+    r"o\d[-_]?"                    # openai o1 / o3 / o4
+    r"|gpt-5"                      # openai gpt-5 family
+    r"|kimi-thinking"              # moonshot kimi-thinking-preview
+    r"|kimi-k2-thinking"           # moonshot kimi-k2-thinking
+    r"|deepseek-reasoner"          # deepseek R1 via chat.deepseek.com
+    r"|deepseek-r1"                # deepseek R1 (other routes)
+    r"|qwq"                        # alibaba QwQ
+    r"|[\w.:-]*-thinking"          # generic *-thinking suffix
+    r"|[\w.:-]*-reasoning"         # generic *-reasoning suffix
+    r")",
     re.IGNORECASE,
 )
 
+# Runtime cache populated when a provider rejects the temperature param at
+# call time (e.g. "invalid temperature: only 1 is allowed for this model").
+# Once a model lands here we treat it as a reasoning model for the rest of
+# the process's lifetime, so the next call skips temperature from the start.
+_TEMPERATURE_BLOCKED_MODELS: set[str] = set()
+
 
 def _is_reasoning_model(model: str) -> bool:
-    return bool(_REASONING_MODEL_RE.match(model or ""))
+    if not model:
+        return False
+    if model in _TEMPERATURE_BLOCKED_MODELS:
+        return True
+    return bool(_REASONING_MODEL_RE.match(model))
+
+
+def _looks_like_temperature_rejection(exc: BaseException) -> bool:
+    """True when the provider rejected the request because temperature is
+    fixed on this model (reasoning models on OpenAI / Moonshot / DeepSeek /
+    Qwen / any OpenAI-compatible gateway). Markers span multiple provider
+    phrasings, so detection works regardless of which base_url the user
+    configured."""
+    msg = str(exc).lower()
+    if "temperature" not in msg:
+        return False
+    return any(
+        marker in msg
+        for marker in (
+            "only 1",                # "only 1 is allowed" / "only 1.0"
+            "does not support",
+            "not supported",
+            "unsupported",
+            "must be 1",
+            "invalid temperature",
+            "not allowed",
+            "is fixed",
+        )
+    )
 
 
 def _supports_json_mode(model: str) -> bool:
@@ -297,10 +343,33 @@ class LLMClient:
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": user})
-        resp = litellm.completion(
-            messages=messages,
-            **self._build_kwargs(json_mode=json_mode),
-        )
+        try:
+            resp = litellm.completion(
+                messages=messages,
+                **self._build_kwargs(json_mode=json_mode),
+            )
+        except Exception as exc:
+            # Runtime auto-detection: some providers silently expose
+            # reasoning models under arbitrary names (kimi-thinking,
+            # grok-4, minimax-m2-reasoning, a local finetune, ...) and
+            # reject temperature / top_p at call time. Cache the model
+            # once, retry without those knobs, and every subsequent call
+            # goes through the reasoning path from the start.
+            if (
+                self.model not in _TEMPERATURE_BLOCKED_MODELS
+                and _looks_like_temperature_rejection(exc)
+            ):
+                logger.warning(
+                    f"LLMClient: {self.model!r} rejected temperature — "
+                    f"treating as a reasoning model for the rest of this run."
+                )
+                _TEMPERATURE_BLOCKED_MODELS.add(self.model)
+                resp = litellm.completion(
+                    messages=messages,
+                    **self._build_kwargs(json_mode=json_mode),
+                )
+            else:
+                raise
         # LiteLLM normalises the response to the OpenAI shape.
         try:
             return resp.choices[0].message.content or ""

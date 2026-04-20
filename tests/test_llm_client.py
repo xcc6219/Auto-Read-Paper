@@ -25,8 +25,23 @@ from auto_read_paper.llm_client import (
     ("o3", True),
     ("gpt-5", True),
     ("openai/gpt-5-turbo", True),
+    # Moonshot / Kimi thinking variants.
+    ("openai/kimi-thinking-preview", True),
+    ("kimi-thinking-preview", True),
+    ("kimi-k2-thinking", True),
+    # DeepSeek R1 / reasoner.
+    ("deepseek/deepseek-reasoner", True),
+    ("openai/deepseek-r1", True),
+    # Alibaba QwQ.
+    ("openai/qwq-32b-preview", True),
+    # Generic *-thinking / *-reasoning suffix (covers future models).
+    ("openai/some-future-thinking", True),
+    ("openai/minimax-m2-reasoning", True),
+    # Non-reasoning chat models stay False.
     ("openai/gpt-4o-mini", False),
     ("openai/gpt-4.5", False),
+    ("openai/kimi-latest", False),
+    ("openai/moonshot-v1-8k", False),
     ("anthropic/claude-sonnet-4-6", False),
     ("gemini/gemini-2.0-flash", False),
     ("deepseek/deepseek-chat", False),
@@ -254,3 +269,73 @@ def test_complete_json_handles_array_expect():
                return_value=_mock_completion('["A", "B"]')):
         result = c.complete_json(system="sys", user="usr", expect="array")
     assert result == ["A", "B"]
+
+
+# ---- runtime reasoning-model auto-detection ---------------------------
+
+def test_temperature_rejection_triggers_retry_and_caches_model():
+    """Unknown model that rejects temperature at call time should: retry
+    without temperature, succeed, and stay cached so subsequent calls skip
+    it from the start."""
+    from auto_read_paper.llm_client import _TEMPERATURE_BLOCKED_MODELS
+
+    model_name = "openai/mystery-model-xyz-42"
+    _TEMPERATURE_BLOCKED_MODELS.discard(model_name)  # clean slate
+
+    c = LLMClient(model=model_name, api_key="sk", temperature=0.3, max_tokens=1024)
+
+    # First call: fail with the Moonshot-style 400, then succeed on retry.
+    rejection = Exception(
+        "litellm.BadRequestError: OpenAIException - "
+        "invalid temperature: only 1 is allowed for this model"
+    )
+    success = _mock_completion('{"ok": true}')
+
+    with patch(
+        "auto_read_paper.llm_client.litellm.completion",
+        side_effect=[rejection, success],
+    ) as mock_completion:
+        result = c.complete_json(system="sys", user="usr")
+
+    assert result == {"ok": True}
+    assert mock_completion.call_count == 2
+
+    # First call had temperature; second (retry) must have dropped it.
+    first_kwargs = mock_completion.call_args_list[0].kwargs
+    second_kwargs = mock_completion.call_args_list[1].kwargs
+    assert first_kwargs.get("temperature") == 0.3
+    assert "temperature" not in second_kwargs
+    # And switched to reasoning-style max_completion_tokens.
+    assert second_kwargs.get("max_completion_tokens") == 1024
+    assert "max_tokens" not in second_kwargs
+
+    # Model is now cached — the next client for the same model should not
+    # send temperature in the first place.
+    assert model_name in _TEMPERATURE_BLOCKED_MODELS
+    c2 = LLMClient(model=model_name, api_key="sk", temperature=0.3, max_tokens=1024)
+    kw = c2._build_kwargs(json_mode=False)
+    assert "temperature" not in kw
+    assert kw.get("max_completion_tokens") == 1024
+
+    _TEMPERATURE_BLOCKED_MODELS.discard(model_name)  # cleanup
+
+
+def test_non_temperature_errors_are_not_swallowed():
+    """Errors unrelated to the temperature param must propagate as-is."""
+    from auto_read_paper.llm_client import _TEMPERATURE_BLOCKED_MODELS
+
+    model_name = "openai/some-other-model-abc"
+    _TEMPERATURE_BLOCKED_MODELS.discard(model_name)
+
+    c = LLMClient(model=model_name, api_key="sk", temperature=0.3)
+
+    boom = RuntimeError("503 upstream unavailable")
+    with patch(
+        "auto_read_paper.llm_client.litellm.completion",
+        side_effect=boom,
+    ) as mock_completion:
+        with pytest.raises(RuntimeError, match="upstream unavailable"):
+            c.complete(system="sys", user="usr")
+
+    assert mock_completion.call_count == 1  # no retry
+    assert model_name not in _TEMPERATURE_BLOCKED_MODELS
