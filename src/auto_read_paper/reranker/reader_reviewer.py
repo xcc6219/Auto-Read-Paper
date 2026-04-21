@@ -52,7 +52,11 @@ READER_SYSTEM_PROMPT = (
     'domain_relevant is one of "yes" / "no" / "uncertain"; relevance_reason is one '
     "short sentence (<= 25 words) explaining which keyword matches the CORE "
     "contribution (or why none does, or why it's ambiguous). "
-    "No prose outside the JSON."
+    "No prose outside the JSON.\n"
+    "\n"
+    "When in doubt, prefer \"uncertain\" over \"yes\" — a senior Reviewer will "
+    "adjudicate. Never default to \"yes\" just because the keyword appears in "
+    "the text; it must describe the CORE contribution."
 )
 
 REVIEWER_SYSTEM_PROMPT = (
@@ -464,10 +468,14 @@ class ReaderReviewerReranker(BaseReranker):
         # Tri-state domain-relevance gate: yes / no / uncertain.
         # - "no"        → dropped immediately.
         # - "uncertain" → adjudicated by the Reviewer (second-opinion call).
-        # Only applies when the user configured keywords AND we're not in a
-        # skip_keyword_filter rescue pass — during rescue the executor is
-        # deliberately widening the net and should not be double-filtered.
-        if self.keywords and not skip_keyword_filter:
+        # Runs whenever the user configured keywords — INCLUDING the
+        # skip_keyword_filter rescue pass. skip_keyword_filter only opts out
+        # of the coarse substring pre-filter (so LLM-expanded / back-catalog
+        # searches aren't double-filtered by the narrow keyword list); the
+        # semantic domain gate still applies so off-topic papers whose
+        # abstracts happen to mention a keyword in passing never reach the
+        # email.
+        if self.keywords:
             kept, dropped, uncertain = [], [], []
             for triple in paper_notes:
                 _i, paper, note = triple

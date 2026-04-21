@@ -244,12 +244,15 @@ def test_gate_mixed_reader_plus_adjudicator(config):
     assert "reviewer" in llm.calls
 
 
-def test_skip_keyword_filter_bypasses_domain_gate(config):
-    # Even a "no" Reader verdict should pass through when rescue is active.
+def test_skip_keyword_filter_still_runs_domain_gate(config):
+    # skip_keyword_filter opts out of the coarse substring pre-filter only.
+    # The semantic domain-relevance gate must STILL run on rescue candidates
+    # so off-topic papers don't slip in through the back-catalog search.
     llm = RoutedLLM(reader_verdicts={"RESCUE": "no"})
     rr = _make_reranker(config, llm)
 
     papers = [_paper("RESCUE paper")]
     out = rr.rerank(papers, [], skip_keyword_filter=True)
-    assert len(out) == 1
+    assert len(out) == 0
+    # "no" is decisive — no adjudicator needed.
     assert "adjudicator" not in llm.calls

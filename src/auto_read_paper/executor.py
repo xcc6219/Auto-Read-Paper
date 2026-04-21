@@ -136,79 +136,118 @@ class Executor:
         # Pool-short fallback: today's RSS is retrieved in full (no cap) and
         # filtered by the user's exact keywords. Only when that primary pool
         # plus unsent history still doesn't reach max_n do we broaden: ask
-        # the LLM to expand the keyword set (synonyms, abbreviations,
-        # adjacent subtopics), then actively query arXiv's past 7 days for
-        # related papers we haven't seen yet. Already-scored and already-sent
-        # IDs are excluded so nothing re-surfaces.
+        # the LLM to expand the keyword set, then walk arXiv's submission
+        # history in progressively wider time windows until the pool is full
+        # or we've exhausted the search horizon.
+        #
+        # Critically, every rescue candidate still passes through the
+        # reranker's semantic domain-relevance gate (skip_keyword_filter only
+        # opts out of the coarse substring pre-filter, not the LLM gate), so
+        # off-topic papers whose abstracts merely mention a keyword in passing
+        # never reach the email. Better to send fewer papers than wrong ones.
         if len(top_papers) < max_n and keywords:
-            already_scored = self.history.existing_ids() if self.history is not None else set()
-            sent_ids = (
-                {e.get("id") for e in self.history.entries if e.get("sent_at")}
-                if self.history is not None
-                else set()
+            arxiv_retriever = self.retrievers.get("arxiv")
+            has_search = (
+                arxiv_retriever is not None
+                and hasattr(arxiv_retriever, "search_by_keywords")
             )
-            logger.info(
-                f"Pool short ({len(top_papers)}/{max_n}) — expanding keywords "
-                f"via LLM and searching arXiv's past 7 days for related papers"
-            )
-            expanded = _expand_keywords(self.llm, keywords)
-            if expanded:
-                logger.info(f"LLM-expanded keywords: {expanded}")
-                combined = keywords + expanded
 
-                fill_candidates: list = []
+            expanded = _expand_keywords(self.llm, keywords) if has_search else []
+            if has_search and not expanded:
+                logger.warning(
+                    "Keyword expansion produced no usable terms — falling back "
+                    "to the user's original keywords for the back-catalog search."
+                )
+            combined = keywords + expanded if has_search else []
 
-                # (a) re-filter today's keyword-rejected papers against the expanded set
-                fresh_spill = [
-                    p for p in spillover_today
-                    if _paper_id(p) not in already_scored and _paper_id(p) not in sent_ids
-                ]
+            # First: re-check today's keyword-rejected retrieval against the
+            # expanded keyword set. Cheap, local, no extra arXiv calls.
+            if combined and spillover_today:
+                already_scored = (
+                    self.history.existing_ids() if self.history is not None else set()
+                )
+                sent_ids = (
+                    {e.get("id") for e in self.history.entries if e.get("sent_at")}
+                    if self.history is not None
+                    else set()
+                )
                 matched_spill = [
-                    p for p in fresh_spill if count_keyword_hits(p, combined) > 0
+                    p for p in spillover_today
+                    if _paper_id(p) not in already_scored
+                    and _paper_id(p) not in sent_ids
+                    and count_keyword_hits(p, combined) > 0
                 ]
                 if matched_spill:
                     logger.info(
                         f"Spillover from today's retrieval: {len(matched_spill)} "
-                        f"paper(s) match expanded keywords"
+                        f"paper(s) match expanded keywords — running through "
+                        f"domain-relevance gate"
                     )
-                    fill_candidates.extend(matched_spill)
+                    scored_spill = self.reranker.rerank(
+                        matched_spill, [], skip_keyword_filter=True
+                    )
+                    if self.history is not None:
+                        self.history.record_newly_scored(scored_spill, today)
+                        pool = self.history.unsent_papers()
+                    else:
+                        pool = pool + list(scored_spill)
+                    pool.sort(key=lambda p: p.score or 0.0, reverse=True)
+                    top_papers = pool[:max_n]
 
-                # (b) actively search arXiv with the expanded keywords.
-                # Fetch 5× max_paper_num, hard-capped at 100 — fast metadata-
-                # only search, so a moderately wide net is cheap; the
-                # Reader + Reviewer downstream agents read each candidate's
-                # full content and rank them. The 100-paper ceiling prevents
-                # a runaway expansion (e.g. user sets max_paper_num=50) from
-                # DoS-ing the arXiv API or the downstream LLM budget.
-                arxiv_retriever = self.retrievers.get("arxiv")
-                if arxiv_retriever is not None and hasattr(arxiv_retriever, "search_by_keywords"):
+            # Progressive time-window back-catalog search. Widens the window
+            # until the pool is full or we've hit the horizon. Every hit
+            # still passes through the domain-relevance gate inside rerank().
+            if has_search and combined and len(top_papers) < max_n:
+                seen_search_ids: set[str] = set()
+                for window_days in (7, 14, 30, 60, 120, 240):
+                    if len(top_papers) >= max_n:
+                        break
+                    logger.info(
+                        f"Back-catalog window={window_days}d — current pool "
+                        f"{len(top_papers)}/{max_n}"
+                    )
+                    already_scored = (
+                        self.history.existing_ids() if self.history is not None else set()
+                    )
+                    sent_ids = (
+                        {e.get("id") for e in self.history.entries if e.get("sent_at")}
+                        if self.history is not None
+                        else set()
+                    )
                     try:
                         searched = arxiv_retriever.search_by_keywords(
                             combined,
-                            days=7,
-                            limit=min(max_n * 5, 100),
+                            days=window_days,
+                            limit=min(max_n * 10, 200),
                         )
                     except Exception as exc:
-                        logger.warning(f"Keyword-search fallback failed: {exc}")
-                        searched = []
-                    searched = [
-                        p for p in searched
-                        if _paper_id(p) not in already_scored
-                        and _paper_id(p) not in sent_ids
-                    ]
-                    # dedup against the spillover we already added
-                    seen_ids = {_paper_id(p) for p in fill_candidates}
-                    searched = [p for p in searched if _paper_id(p) not in seen_ids]
-                    if searched:
-                        logger.info(
-                            f"Active arXiv keyword-search yielded {len(searched)} "
-                            f"additional paper(s)"
+                        logger.warning(
+                            f"Back-catalog search at {window_days}d failed: {exc}"
                         )
-                        fill_candidates.extend(searched)
-
-                if fill_candidates:
+                        continue
+                    fresh = []
+                    for p in searched:
+                        pid = _paper_id(p)
+                        if (
+                            pid in already_scored
+                            or pid in sent_ids
+                            or pid in seen_search_ids
+                        ):
+                            continue
+                        seen_search_ids.add(pid)
+                        fresh.append(p)
+                    if not fresh:
+                        logger.info(
+                            f"  window={window_days}d yielded 0 new candidates "
+                            f"(all already scored/sent/seen)"
+                        )
+                        continue
+                    logger.info(
+                        f"  window={window_days}d: {len(fresh)} new candidate(s) "
+                        f"— running domain-relevance gate"
+                    )
                     scored_fill = self.reranker.rerank(
-                        fill_candidates, [], skip_keyword_filter=True
+                        fresh, [], skip_keyword_filter=True
                     )
                     if self.history is not None:
                         self.history.record_newly_scored(scored_fill, today)
@@ -217,18 +256,20 @@ class Executor:
                         pool = pool + list(scored_fill)
                     pool.sort(key=lambda p: p.score or 0.0, reverse=True)
                     top_papers = pool[:max_n]
-            else:
-                logger.warning(
-                    "Keyword expansion produced no usable terms — leaving pool short "
-                    "rather than injecting off-topic papers."
-                )
 
-        # Last-resort heartbeat: if even the unsent pool is empty (first run,
-        # very quiet day, or the user already consumed everything in previous
-        # pushes today), pull a few recent arXiv papers so the pipeline still
-        # produces a visible signal. These are scored and recorded as newly-
-        # scored entries, NOT pulled from already-sent history.
-        if not top_papers:
+                if len(top_papers) < max_n:
+                    logger.info(
+                        f"Back-catalog exhausted: pool still short "
+                        f"({len(top_papers)}/{max_n}). Sending what we have "
+                        f"rather than diluting with off-topic papers."
+                    )
+
+        # Last-resort heartbeat: only when the user did NOT configure
+        # keywords and the unsent pool is empty. With keywords configured,
+        # the progressive back-catalog above is the correct path and
+        # heartbeat filler would just bypass the domain gate we just
+        # installed.
+        if not top_papers and not keywords:
             arxiv_retriever = self.retrievers.get("arxiv")
             if arxiv_retriever is not None and hasattr(arxiv_retriever, "retrieve_fallback_papers"):
                 logger.info("Pool empty — fetching recent arXiv papers as heartbeat fallback")
@@ -237,8 +278,6 @@ class Executor:
                 except Exception as exc:
                     logger.warning(f"Heartbeat fallback failed: {exc}")
                     fb = []
-                # Skip anything we've already sent so the heartbeat never
-                # re-shows an old paper.
                 if fb and self.history is not None:
                     sent_ids = {
                         e.get("id") for e in self.history.entries if e.get("sent_at")
