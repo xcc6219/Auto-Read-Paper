@@ -55,6 +55,13 @@ def _clean_tldr(raw: str) -> str:
     return text.strip().replace("\n", "<br>")
 
 
+def _has_all_anchors(text: str) -> bool:
+    """True iff the cleaned TLDR contains all three section anchors."""
+    if not text:
+        return False
+    return all(anchor in text for anchor in _SECTION_ANCHORS)
+
+
 @dataclass
 class Paper:
     source: str
@@ -87,17 +94,57 @@ class Paper:
         out = out.strip("\"'「」“”").splitlines()[-1].strip() if out else ""
         return out or None
 
-    def generate_title_zh(self, llm: LLMClient, language: str) -> Optional[str]:
-        try:
-            title_zh = self._generate_title_translation_with_llm(llm, language)
-            self.title_zh = title_zh
-            return title_zh
-        except Exception as e:
-            logger.warning(f"Failed to translate title of {self.url}: {e}")
+    def generate_title_zh(
+        self, llm: LLMClient, language: str, *, max_attempts: int = 3
+    ) -> Optional[str]:
+        """Translate the title, retrying on transient LLM/network errors.
+
+        Returns None if every attempt fails so the caller can decide whether
+        to drop the paper vs. fall back to the English title in the email.
+        """
+        lang = (language or "Chinese").strip()
+        if lang.lower() == "english" or not self.title:
             self.title_zh = None
             return None
+        last_err: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                title_zh = self._generate_title_translation_with_llm(llm, language)
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    f"Title translation attempt {attempt}/{max_attempts} "
+                    f"raised for {self.url}: {e}"
+                )
+                continue
+            if title_zh:
+                self.title_zh = title_zh
+                return title_zh
+            logger.warning(
+                f"Title translation attempt {attempt}/{max_attempts} "
+                f"produced empty output for {self.url}"
+            )
+        if last_err is not None:
+            logger.warning(
+                f"Title translation gave up after {max_attempts} attempts for "
+                f"{self.url}: {last_err}"
+            )
+        self.title_zh = None
+        return None
 
-    def _generate_tldr_with_llm(self, llm: LLMClient, language: str) -> str:
+    def _build_tldr_paper_body(self, llm: LLMClient) -> Optional[str]:
+        paper_body = ""
+        if self.title:
+            paper_body += f"Title:\n {self.title}\n\n"
+        if self.abstract:
+            paper_body += f"Abstract: {self.abstract}\n\n"
+        if self.full_text:
+            paper_body += f"Preview of main content:\n {self.full_text}\n\n"
+        if not self.full_text and not self.abstract:
+            return None
+        return llm.truncate_to_tokens(paper_body, 4000)
+
+    def _generate_tldr_oneshot(self, llm: LLMClient, language: str) -> str:
         lang = (language or "Chinese").strip() or "Chinese"
         instructions = (
             f"Read the paper below and output a structured summary in {lang}, following the exact format.\n"
@@ -113,23 +160,10 @@ class Paper:
             f"and how it differs from / improves upon prior work>\n"
             f"[VALUE] <1-2 sentences in {lang} describing real-world impact, likely applications, or follow-up research value>\n\n"
         )
-
-        paper_body = ""
-        if self.title:
-            paper_body += f"Title:\n {self.title}\n\n"
-        if self.abstract:
-            paper_body += f"Abstract: {self.abstract}\n\n"
-        if self.full_text:
-            paper_body += f"Preview of main content:\n {self.full_text}\n\n"
-
-        if not self.full_text and not self.abstract:
-            logger.warning(f"Neither full text nor abstract is provided for {self.url}")
-            return "Failed to generate TLDR. Neither full text nor abstract is provided"
-
-        # Truncate the untrusted body to fit the model's context window.
-        paper_body = llm.truncate_to_tokens(paper_body, 4000)
+        paper_body = self._build_tldr_paper_body(llm)
+        if paper_body is None:
+            return ""
         user = instructions + _wrap_untrusted(paper_body)
-
         system = (
             f"You are a senior AI researcher summarising academic papers for busy readers. "
             f"Write the entire response in {lang}. Only widely-used English technical abbreviations "
@@ -144,16 +178,154 @@ class Paper:
         raw = llm.complete(system=system, user=user) or ""
         return _clean_tldr(raw)
 
-    def generate_tldr(self, llm: LLMClient, language: str = "Chinese") -> str:
-        try:
-            tldr = self._generate_tldr_with_llm(llm, language)
-            self.tldr = tldr
-            return tldr
-        except Exception as e:
-            logger.warning(f"Failed to generate tldr of {self.url}: {e}")
-            tldr = self.abstract
-            self.tldr = tldr
-            return tldr
+    def _generate_tldr_single_section(
+        self, llm: LLMClient, language: str, anchor: str
+    ) -> Optional[str]:
+        """Generate just one section of the TLDR. Used as per-section fallback
+        when the one-shot call fails or produces incomplete output."""
+        lang = (language or "Chinese").strip() or "Chinese"
+        paper_body = self._build_tldr_paper_body(llm)
+        if paper_body is None:
+            return None
+        section_specs = {
+            "[CORE]": (
+                "the CORE section: 1-2 sentences describing the problem, the "
+                "method, and the task setting"
+            ),
+            "[INNOVATION]": (
+                "the INNOVATION section: 2-3 sentences, more detailed — the "
+                "pain point being solved, the core idea of the method, and how "
+                "it differs from or improves upon prior work"
+            ),
+            "[VALUE]": (
+                "the VALUE section: 1-2 sentences describing real-world impact, "
+                "likely applications, or follow-up research value"
+            ),
+        }
+        spec = section_specs.get(anchor)
+        if spec is None:
+            return None
+        system = (
+            f"You are a senior AI researcher summarising academic papers for "
+            f"busy readers. Write ONLY {spec}. Output the single anchor tag "
+            f"{anchor} verbatim followed by the content in {lang}. "
+            f"Widely-used English technical abbreviations (RL, MPC, RAG, LLM) "
+            f"may stay in English. Do NOT output chain-of-thought, preamble, "
+            f"other section tags, or closing notes. Start directly with {anchor}."
+        )
+        user = (
+            f"Write only {anchor} for the paper below.\n\n" + _wrap_untrusted(paper_body)
+        )
+        raw = llm.complete(system=system, user=user) or ""
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL | re.IGNORECASE)
+        idx = raw.rfind(anchor)
+        if idx == -1:
+            return None
+        section = raw[idx:].strip()
+        # Trim at the next anchor if the model leaked another section.
+        for other in _SECTION_ANCHORS:
+            if other == anchor:
+                continue
+            cut = section.find(other)
+            if cut != -1:
+                section = section[:cut].strip()
+        return section or None
+
+    def generate_tldr(
+        self, llm: LLMClient, language: str = "Chinese", *, max_attempts: int = 2
+    ) -> Optional[str]:
+        """Generate a three-section TLDR with retry + per-section fallback.
+
+        Strategy:
+          1. One-shot call up to ``max_attempts`` times. Accept on the first
+             attempt that returns all three anchors.
+          2. If still incomplete, issue ONE call per missing section (with a
+             single retry each). Reuse any sections the one-shot already got.
+          3. If still missing any section, return None so the executor can
+             drop this paper and top up from the pool.
+        """
+        paper_body = self._build_tldr_paper_body(llm)
+        if paper_body is None:
+            logger.warning(f"Neither full text nor abstract is provided for {self.url}")
+            self.tldr = None
+            return None
+
+        # Phase 1: one-shot, with retries.
+        best = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                cleaned = self._generate_tldr_oneshot(llm, language)
+            except Exception as e:
+                logger.warning(
+                    f"TLDR one-shot attempt {attempt}/{max_attempts} raised "
+                    f"for {self.url}: {e}"
+                )
+                continue
+            if _has_all_anchors(cleaned):
+                self.tldr = cleaned
+                return cleaned
+            # Track the best partial so we can reuse any sections it got right.
+            if cleaned and sum(a in cleaned for a in _SECTION_ANCHORS) > sum(
+                a in best for a in _SECTION_ANCHORS
+            ):
+                best = cleaned
+
+        logger.warning(
+            f"TLDR one-shot never produced all three anchors for {self.url} — "
+            f"falling back to per-section generation"
+        )
+
+        # Phase 2: per-section fallback. Reuse anchors we already have.
+        sections: dict[str, str] = {}
+        if best:
+            # Extract any clean sections from the best one-shot attempt.
+            parts = re.split(r"(\[CORE\]|\[INNOVATION\]|\[VALUE\])", best)
+            current: Optional[str] = None
+            for chunk in parts:
+                if chunk in _SECTION_ANCHORS:
+                    current = chunk
+                    continue
+                if current is None:
+                    continue
+                body = chunk.strip()
+                if body:
+                    sections[current] = f"{current} {body}"
+                current = None
+
+        for anchor in _SECTION_ANCHORS:
+            if anchor in sections:
+                continue
+            got: Optional[str] = None
+            for attempt in range(1, 3):  # 2 tries per section
+                try:
+                    got = self._generate_tldr_single_section(llm, language, anchor)
+                except Exception as e:
+                    logger.warning(
+                        f"TLDR {anchor} attempt {attempt}/2 raised for "
+                        f"{self.url}: {e}"
+                    )
+                    got = None
+                if got:
+                    break
+            if got:
+                sections[anchor] = got
+            else:
+                logger.warning(
+                    f"TLDR {anchor} per-section fallback failed for {self.url}"
+                )
+
+        if all(a in sections for a in _SECTION_ANCHORS):
+            joined = "\n".join(sections[a] for a in _SECTION_ANCHORS)
+            self.tldr = _clean_tldr(joined)
+            return self.tldr
+
+        logger.warning(
+            f"TLDR generation gave up for {self.url} — missing "
+            f"{[a for a in _SECTION_ANCHORS if a not in sections]}"
+        )
+        self.tldr = None
+        return None
+
 
     def _generate_affiliations_with_llm(self, llm: LLMClient) -> Optional[list[str]]:
         if self.full_text is None:

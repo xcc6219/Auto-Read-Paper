@@ -53,6 +53,8 @@ def _paper_to_entry(paper: Paper, scored_at: str) -> dict:
         "full_text": paper.full_text,
         "affiliations": paper.affiliations,
         "score": paper.score,
+        "tldr": paper.tldr,
+        "title_zh": getattr(paper, "title_zh", None),
         "scored_at": scored_at,
         "sent_at": None,
     }
@@ -69,6 +71,8 @@ def _entry_to_paper(entry: dict) -> Paper:
         full_text=entry.get("full_text"),
         affiliations=entry.get("affiliations"),
         score=entry.get("score"),
+        tldr=entry.get("tldr"),
+        title_zh=entry.get("title_zh"),
     )
 
 
@@ -169,6 +173,40 @@ class ScoreHistory:
             added += 1
         if added:
             logger.info(f"Added {added} newly-scored papers to history")
+
+    def update_generated_fields(self, papers: list[Paper]) -> None:
+        """Persist tldr / title_zh / affiliations onto existing history entries.
+
+        TLDR generation is the most expensive LLM call in the pipeline and can
+        fail (rate limit, parse error). Persisting successful results means a
+        paper carried in the unsent pool across days doesn't have to re-run
+        the deep-read on every retry — and a flaky TLDR call won't permanently
+        corrupt the entry to the abstract fallback either, since the next
+        successful generation will overwrite it.
+        """
+        if not papers:
+            return
+        by_id = {_paper_id(p): p for p in papers}
+        updated = 0
+        for e in self.entries:
+            p = by_id.get(e.get("id"))
+            if p is None:
+                continue
+            changed = False
+            if p.tldr and e.get("tldr") != p.tldr:
+                e["tldr"] = p.tldr
+                changed = True
+            tzh = getattr(p, "title_zh", None)
+            if tzh and e.get("title_zh") != tzh:
+                e["title_zh"] = tzh
+                changed = True
+            if p.affiliations and e.get("affiliations") != p.affiliations:
+                e["affiliations"] = p.affiliations
+                changed = True
+            if changed:
+                updated += 1
+        if updated:
+            logger.info(f"Persisted generated fields for {updated} paper(s) to history")
 
     def mark_sent(self, papers: list[Paper], today: str) -> None:
         ids_to_mark = {_paper_id(p) for p in papers}

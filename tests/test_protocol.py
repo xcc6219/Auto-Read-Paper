@@ -11,32 +11,41 @@ from tests.canned_responses import make_sample_paper, make_stub_llm_client
 
 
 def test_tldr_returns_response():
-    llm = make_stub_llm_client()
+    # When the LLM returns a fully-anchored TLDR, generate_tldr returns it as-is.
+    canned = "[CORE] core sentence. [INNOVATION] innovation sentence. [VALUE] value sentence."
+    llm = make_stub_llm_client(responses={"senior AI researcher": canned})
     paper = make_sample_paper()
     result = paper.generate_tldr(llm, "English")
-    assert result == "Hello! How can I assist you today?"
+    assert result is not None
+    assert "[CORE]" in result and "[INNOVATION]" in result and "[VALUE]" in result
     assert paper.tldr == result
 
 
 def test_tldr_without_abstract_or_fulltext():
+    # No content to summarise → return None (caller should drop the paper).
     llm = make_stub_llm_client()
     paper = make_sample_paper(abstract="", full_text=None)
     result = paper.generate_tldr(llm, "English")
-    assert "Failed to generate TLDR" in result
+    assert result is None
+    assert paper.tldr is None
 
 
-def test_tldr_falls_back_to_abstract_on_error():
+def test_tldr_returns_none_on_persistent_error():
+    # Every retry raises → caller sees None and drops the paper from the email.
     paper = make_sample_paper()
     broken = make_stub_llm_client(raises=RuntimeError("API down"))
     result = paper.generate_tldr(broken, "English")
-    assert result == paper.abstract
+    assert result is None
+    assert paper.tldr is None
 
 
 def test_tldr_truncates_long_prompt():
-    llm = make_stub_llm_client()
+    canned = "[CORE] c. [INNOVATION] i. [VALUE] v."
+    llm = make_stub_llm_client(responses={"senior AI researcher": canned})
     paper = make_sample_paper(full_text="word " * 10000)
     result = paper.generate_tldr(llm, "English")
     assert result is not None
+    assert "[CORE]" in result
 
 
 # ---------------------------------------------------------------------------

@@ -297,18 +297,87 @@ class Executor:
                 self.history.save()
             return
 
-        if top_papers:
-            logger.info(f"Generating deep summaries for top {len(top_papers)} papers...")
-            lang = str(self.config.llm.get("language", "Chinese"))
-            for p in tqdm(top_papers):
-                if not p.tldr:
-                    p.generate_tldr(self.llm, lang)
-                if not p.affiliations:
-                    p.generate_affiliations(self.llm)
-                if lang.lower() != "english" and not getattr(p, "title_zh", None):
-                    p.generate_title_zh(self.llm, lang)
-
+        # Deep-read pass with drop-and-top-up: a paper whose TLDR or (in
+        # bilingual mode) title translation never finalises gets dropped and
+        # we promote the next-best paper from the pool. This keeps the email
+        # at max_paper_num while ensuring every shipped card has all three
+        # sections + the localised title.
         lang = str(self.config.llm.get("language", "Chinese"))
+        bilingual = lang.lower() != "english"
+
+        if top_papers:
+            logger.info(
+                f"Generating deep summaries for top {len(top_papers)} papers..."
+            )
+            ready: list = []
+            attempted_ids: set[str] = set()
+            queue = list(top_papers)
+            backfill = [
+                p for p in pool
+                if _paper_id(p) not in {_paper_id(x) for x in queue}
+            ]
+
+            with tqdm(total=max_n) as bar:
+                while queue and len(ready) < max_n:
+                    p = queue.pop(0)
+                    pid = _paper_id(p)
+                    if pid in attempted_ids:
+                        continue
+                    attempted_ids.add(pid)
+
+                    if not p.tldr:
+                        p.generate_tldr(self.llm, lang)
+                    if not p.affiliations:
+                        p.generate_affiliations(self.llm)
+                    if bilingual and not getattr(p, "title_zh", None):
+                        p.generate_title_zh(self.llm, lang)
+
+                    tldr_ok = bool(p.tldr) and all(
+                        a in p.tldr for a in ("[CORE]", "[INNOVATION]", "[VALUE]")
+                    )
+                    title_ok = (not bilingual) or bool(getattr(p, "title_zh", None))
+
+                    if tldr_ok and title_ok:
+                        ready.append(p)
+                        bar.update(1)
+                    else:
+                        missing = []
+                        if not tldr_ok:
+                            missing.append("tldr")
+                        if not title_ok:
+                            missing.append("title_zh")
+                        logger.warning(
+                            f"Dropping paper after deep-read retries failed "
+                            f"({', '.join(missing)} missing): {p.title[:90]}"
+                        )
+                        # Promote the next pool candidate to keep the count.
+                        while backfill:
+                            cand = backfill.pop(0)
+                            if _paper_id(cand) in attempted_ids:
+                                continue
+                            queue.append(cand)
+                            break
+
+            top_papers = ready
+            if len(top_papers) < max_n:
+                logger.warning(
+                    f"Only {len(top_papers)}/{max_n} papers survived the "
+                    f"deep-read pass — pool exhausted."
+                )
+
+        # Persist generated tldr/title_zh/affiliations onto history entries
+        # BEFORE sending. If the SMTP send fails, the work isn't lost; if
+        # the user retries the run, history.unsent_papers() rehydrates with
+        # the cached deep-read content and skips regeneration.
+        if self.history is not None:
+            self.history.update_generated_fields(top_papers)
+
+        if not top_papers and not self.config.executor.send_empty:
+            logger.info("No papers survived the deep-read pass — no email will be sent.")
+            if self.history is not None:
+                self.history.save()
+            return
+
         email_content = render_email(top_papers, lang)
 
         if self.history is not None:
