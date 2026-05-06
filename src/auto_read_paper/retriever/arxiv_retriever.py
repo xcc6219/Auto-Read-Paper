@@ -29,6 +29,32 @@ DOWNLOAD_TIMEOUT = (10, 60)
 PDF_EXTRACT_TIMEOUT = 180
 TAR_EXTRACT_TIMEOUT = 180
 
+# arxiv.py 3.x hard-codes ``user-agent: arxiv.py/2.3.2`` on every request, and
+# the arXiv API began returning HTTP 406 (Not Acceptable) for that exact UA in
+# May 2026. The bare ``requests`` calls in this module aren't affected because
+# they use the default ``python-requests/X.Y`` UA. The patch below routes the
+# arxiv client's session.get through a wrapper that swaps the UA out before
+# the request goes over the wire.
+_ARXIV_USER_AGENT = "Mozilla/5.0 (compatible; auto-read-paper/1.0; +https://arxiv.org)"
+
+
+def _make_arxiv_client(num_retries: int, delay_seconds: float) -> arxiv.Client:
+    client = arxiv.Client(num_retries=num_retries, delay_seconds=delay_seconds)
+    session = getattr(client, "_session", None)
+    if session is None:
+        # Stubbed clients (e.g. test fixtures) have no ``_session``; skip the
+        # UA patch and let them serve canned results unchanged.
+        return client
+    original_get = session.get
+
+    def patched_get(url, **kwargs):
+        headers = dict(kwargs.pop("headers", None) or {})
+        headers["user-agent"] = _ARXIV_USER_AGENT
+        return original_get(url, headers=headers, **kwargs)
+
+    session.get = patched_get  # type: ignore[method-assign]
+    return client
+
 # M2: allowlist + size cap for paper-file downloads. Plugin retrievers that
 # produce URLs pointing at unexpected hosts now fail loud rather than
 # silently streaming arbitrary content. 50 MB covers every arXiv PDF /
@@ -255,7 +281,7 @@ class ArxivRetriever(BaseRetriever):
         """
         import random
 
-        client = arxiv.Client(num_retries=5, delay_seconds=5)
+        client = _make_arxiv_client(num_retries=5, delay_seconds=5)
         categories = list(self.config.source.arxiv.category)
         cat_query = " OR ".join(f"cat:{c}" for c in categories)
         # Pull generously, then filter by keywords + randomly sample.
@@ -302,7 +328,7 @@ class ArxivRetriever(BaseRetriever):
         return sampled
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
+        client = _make_arxiv_client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -387,7 +413,7 @@ class ArxivRetriever(BaseRetriever):
         without drifting off-topic."""
         if not keywords or limit <= 0:
             return []
-        client = arxiv.Client(num_retries=5, delay_seconds=5)
+        client = _make_arxiv_client(num_retries=5, delay_seconds=5)
         categories = list(self.config.source.arxiv.category)
         cat_clause = " OR ".join(f"cat:{c}" for c in categories)
         # ti:"kw" OR abs:"kw" for each keyword; arXiv's query parser tolerates
