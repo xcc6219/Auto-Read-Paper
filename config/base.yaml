@@ -21,6 +21,7 @@ llm:
   timeout: 60 # Per-request timeout in seconds. Prevents a hung local Ollama from wedging the job.
   max_retries: 3 # LiteLLM-level retry count on 429/5xx.
   language: Chinese # Output language for the AI summary (TLDR).
+  embedding_model: null # Optional. When set, enables an embedding-similarity terminal gate in the executor that drops papers whose title+abstract is semantically far from the user's keywords (catches off-topic papers that slipped past the LLM domain gate, e.g. "distributed training" papers reaching a "medical image analysis" subscription). Pick a model served by the same base_url — e.g. openai/text-embedding-3-small (OpenAI), openai/embo-01 (MiniMax). Skipped silently if the call fails or this is null.
 
 reranker:
   keyword_llm:
@@ -48,3 +49,4 @@ executor:
   max_paper_num: 10 # Maximum papers shown in the email (Top-N).
   source: ['arxiv']
   reranker: reader_reviewer # Options: 'reader_reviewer' (multi-agent, default, token-efficient & higher-quality) or 'keyword_llm' (single-agent, per-paper LLM scoring).
+  embedding_threshold: 0.30 # Cosine-similarity floor for the embedding gate (only used when llm.embedding_model is set). Lower = more permissive, higher = stricter. 0.30 empirically separates "medical imaging" vs "MRI tumor segmentation" (~0.65) from "medical imaging" vs "distributed training" (~0.20).

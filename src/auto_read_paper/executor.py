@@ -1,3 +1,5 @@
+import math
+
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from .retriever import get_retriever_cls
@@ -7,39 +9,192 @@ from .construct_email import render_email
 from .utils import send_email
 from .history import ScoreHistory, _today_iso, _paper_id
 from .llm_client import LLMClient
+from .protocol import Paper
 from tqdm import tqdm
 
 
-def _expand_keywords(llm: LLMClient, keywords: list[str], n: int = 12) -> list[str]:
-    """Ask the LLM for related/alternative keywords covering the same research
-    area. Used to refill the candidate pool when too few papers hit the
-    user's exact keywords — instead of dropping the filter entirely and
-    letting unrelated papers in, we broaden the filter with AI-suggested
-    synonyms, abbreviations, and adjacent subtopics."""
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return 0.0
+    s = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return s / (na * nb)
+
+
+def _embedding_relevance_filter(
+    llm: LLMClient,
+    papers: list[Paper],
+    keywords: list[str],
+    threshold: float,
+) -> list[Paper]:
+    """Final relevance gate using embedding cosine similarity.
+
+    Decoupled from the LLM domain gate inside the reranker so that a weak
+    chat model misjudging "the paper's CORE contribution is in this domain"
+    can still be caught here on raw semantic distance. Skipped silently
+    (returns the input unchanged) when no ``embedding_model`` is configured
+    or the embedding call fails.
+    """
+    if not papers or not keywords:
+        return papers
+    if not llm.embedding_model:
+        return papers
+    keyword_text = "; ".join(keywords)
+    paper_texts = [
+        f"{p.title or ''}\n\n{p.abstract or ''}".strip()
+        for p in papers
+    ]
+    embeddings = llm.embed([keyword_text] + paper_texts)
+    if embeddings is None or len(embeddings) != len(papers) + 1:
+        # Failed call or partial response — log already happened in embed();
+        # don't drop anything.
+        return papers
+    kw_emb = embeddings[0]
+    keep: list[Paper] = []
+    drop: list[tuple[Paper, float]] = []
+    for paper, emb in zip(papers, embeddings[1:]):
+        sim = _cosine(kw_emb, emb)
+        if sim >= threshold:
+            keep.append(paper)
+        else:
+            drop.append((paper, sim))
+    if drop:
+        logger.info(
+            f"Embedding gate: dropped {len(drop)}/{len(papers)} paper(s) below "
+            f"cosine {threshold:.2f}"
+        )
+        for p, sim in drop[:5]:
+            logger.info(f"  embed-drop sim={sim:.3f}: {p.title[:90]}")
+        if len(drop) > 5:
+            logger.info(f"  ... and {len(drop) - 5} more")
+    else:
+        sims = [_cosine(kw_emb, e) for e in embeddings[1:]]
+        if sims:
+            logger.info(
+                f"Embedding gate: all {len(papers)} paper(s) passed "
+                f"(min sim {min(sims):.3f})"
+            )
+    return keep
+
+
+# Single-word generic ML/CS terms the LLM frequently invents when asked to
+# "expand" keywords. Letting any of these into the back-catalog query
+# turns ``ti:"X" OR abs:"X"`` into a dragnet that catches every paper on
+# arxiv. A user who configures "medical image analysis" doesn't want to
+# back-catalog every paper that uses the word "training".
+_EXPANSION_STOPWORDS = frozenset({
+    "ai", "ml", "dl", "cv", "nlp",
+    "training", "model", "models", "modeling", "learning", "learned",
+    "neural", "network", "networks", "deep", "shallow",
+    "image", "images", "imaging", "video", "videos", "audio",
+    "data", "dataset", "datasets",
+    "method", "methods", "approach", "approaches",
+    "algorithm", "algorithms", "framework", "frameworks",
+    "system", "systems", "pipeline", "pipelines",
+    "evaluation", "benchmark", "benchmarks", "metric", "metrics",
+    "performance", "accuracy", "efficiency",
+    "analysis", "study", "research", "survey",
+    "feature", "features", "embedding", "embeddings",
+    "task", "tasks", "application", "applications",
+    "supervised", "unsupervised", "self-supervised",
+    "transformer", "transformers", "attention",
+    "classification", "regression", "prediction",
+    "optimization", "loss", "gradient",
+})
+
+
+def _is_acceptable_expansion(kw: str, user_keywords_lower: list[str]) -> bool:
+    """Filter out LLM-invented expansions that would over-broaden the
+    back-catalog search. We accept a candidate iff it is either:
+      * multi-word (any phrase >=2 tokens — those are usually specific
+        enough to stay on-topic); or
+      * a single token of length >=4 that is not a generic CS/ML stopword
+        AND not already a substring of one of the user's original keywords
+        (substring duplicates add no recall).
+    """
+    if not kw:
+        return False
+    tokens = kw.split()
+    if len(tokens) >= 2:
+        # Multi-word phrases are presumed specific. Still reject if it's
+        # purely a substring of an existing user keyword (no value).
+        if any(kw in uk for uk in user_keywords_lower):
+            return False
+        return True
+    # Single-word: be strict.
+    if len(kw) < 4:
+        return False
+    if kw in _EXPANSION_STOPWORDS:
+        return False
+    if any(kw in uk for uk in user_keywords_lower):
+        return False
+    return True
+
+
+def _expand_keywords(llm: LLMClient, keywords: list[str], n: int = 6) -> list[str]:
+    """Ask the LLM for tight synonyms / abbreviations of the user's research
+    keywords, used only to refill the back-catalog when today's RSS came
+    up short. We previously asked for 12 broad expansions which let
+    weaker LLMs drift into generic terms ("training", "image") and turn
+    the rescue path into a dragnet. Now: at most 6, synonym-only,
+    multi-word preferred, with a generic-stopword filter on the output.
+    """
     if not keywords:
         return []
     system = (
-        "You are a research librarian. Given a user's research keywords, "
-        "produce related terms, common synonyms, and abbreviations that "
-        "would match papers on the same topics. Stay tight to the user's "
-        "research area — do not drift into unrelated fields."
+        "You are a research librarian helping refine an arXiv search. The user "
+        "has a NARROW research focus expressed as a few keywords. Your job is "
+        "to produce SYNONYMS and standard ABBREVIATIONS for those EXACT "
+        "concepts — terms that an author working on the SAME topic would use "
+        "interchangeably with the user's keywords.\n"
+        "\n"
+        "STRICT RULES:\n"
+        "  • Only synonyms / abbreviations / canonical alternative names. "
+        "    NOT 'related areas', NOT 'methods commonly used', NOT 'broader "
+        "    fields'. Example: for 'medical image analysis', good = "
+        "    'medical imaging', 'biomedical image analysis', 'CAD'; bad = "
+        "    'deep learning', 'segmentation', 'CNN', 'image processing'.\n"
+        "  • Prefer multi-word phrases. Single words are usually too generic.\n"
+        "  • Stay strictly inside the user's research area — when in doubt, "
+        "    return fewer terms. A short list of tight synonyms beats a long "
+        "    list that drifts.\n"
+        "  • No generic terms like 'training', 'model', 'image', 'method', "
+        "    'evaluation', 'framework', 'analysis' on their own."
     )
     user = (
         f"User keywords: {', '.join(keywords)}\n\n"
-        f"Return ONLY a JSON array of up to {n} additional keywords (strings), "
-        f"lowercase, no duplicates of the user's keywords, no prose."
+        f"Return ONLY a JSON array of AT MOST {n} synonyms / abbreviations "
+        f"(strings), lowercase, no duplicates of the user's keywords, no prose."
     )
     result = llm.complete_json(system=system, user=user, expect="array")
     if not isinstance(result, list):
         logger.warning("Keyword expansion LLM call returned no usable list")
         return []
-    seen = {k.lower() for k in keywords}
+    user_lower = [k.lower() for k in keywords]
+    seen = set(user_lower)
     expanded: list[str] = []
+    rejected: list[str] = []
     for k in result:
-        if isinstance(k, str) and k.strip() and k.strip().lower() not in seen:
-            kw = k.strip().lower()
-            expanded.append(kw)
-            seen.add(kw)
+        if not isinstance(k, str):
+            continue
+        kw = k.strip().lower()
+        if not kw or kw in seen:
+            continue
+        if not _is_acceptable_expansion(kw, user_lower):
+            rejected.append(kw)
+            continue
+        expanded.append(kw)
+        seen.add(kw)
+        if len(expanded) >= n:
+            break
+    if rejected:
+        logger.info(
+            f"Keyword expansion: kept {len(expanded)} term(s), rejected "
+            f"{len(rejected)} generic/duplicate term(s) (e.g. {rejected[:3]})"
+        )
     return expanded
 
 
@@ -263,6 +418,23 @@ class Executor:
                         f"({len(top_papers)}/{max_n}). Sending what we have "
                         f"rather than diluting with off-topic papers."
                     )
+
+        # Embedding-similarity terminal gate. Catches off-topic papers that
+        # slipped through the LLM domain gate (typically because the chat
+        # model is small/cheap and over-eagerly says "yes"). Skipped silently
+        # when llm.embedding_model isn't configured. Threshold defaults to
+        # 0.30 — empirically tight enough to drop "medical imaging" vs
+        # "distributed training" while keeping "medical imaging" vs "MRI
+        # tumor segmentation" pairs.
+        if top_papers and keywords:
+            threshold = float(
+                self.config.executor.get("embedding_threshold", 0.30)
+                if hasattr(self.config.executor, "get")
+                else 0.30
+            )
+            top_papers = _embedding_relevance_filter(
+                self.llm, top_papers, keywords, threshold
+            )
 
         # Last-resort heartbeat: only when the user did NOT configure
         # keywords and the unsent pool is empty. With keywords configured,

@@ -228,6 +228,7 @@ class LLMClient:
         max_retries: int = 3,
         seed: int | None = None,
         extra: Mapping[str, Any] | None = None,
+        embedding_model: str | None = None,
     ):
         if not model:
             raise ValueError("LLMClient requires a non-empty model name")
@@ -240,6 +241,9 @@ class LLMClient:
         self.max_retries = int(max_retries)
         self.seed = int(seed) if seed is not None else None
         self.extra = dict(extra or {})
+        self.embedding_model = (
+            _normalize_model_name(embedding_model, base_url) if embedding_model else None
+        )
 
     @classmethod
     def from_config(cls, llm_cfg: DictConfig | Mapping) -> "LLMClient":
@@ -284,6 +288,7 @@ class LLMClient:
             if k in cfg:
                 extra[k] = cfg[k]
 
+        embedding_model = cfg.get("embedding_model")
         return cls(
             model=str(model),
             api_key=api.get("key") or cfg.get("api_key"),
@@ -294,6 +299,7 @@ class LLMClient:
             max_retries=max_retries,
             seed=seed,
             extra=extra,
+            embedding_model=str(embedding_model) if embedding_model else None,
         )
 
     # ---- low-level ------------------------------------------------------
@@ -436,3 +442,41 @@ class LLMClient:
             # Character-level fallback.
             approx_chars = max_tokens * 4
             return text[:approx_chars]
+
+    # ---- embeddings -----------------------------------------------------
+
+    def embed(self, texts: list[str]) -> list[list[float]] | None:
+        """Embed a list of texts via ``litellm.embedding``.
+
+        Returns the embedding vectors in input order, or ``None`` when no
+        ``embedding_model`` was configured / the call failed (caller treats
+        ``None`` as "skip the embedding-based gate"). LiteLLM routes through
+        the same ``api_key`` / ``api_base`` as chat completions, so any
+        OpenAI-compatible endpoint that exposes ``/v1/embeddings`` works
+        with whatever model name the user configures.
+        """
+        if not self.embedding_model or not texts:
+            return None
+        kwargs: dict[str, Any] = {
+            "model": self.embedding_model,
+            "input": list(texts),
+            "timeout": self.timeout,
+            "num_retries": self.max_retries,
+        }
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.base_url:
+            kwargs["api_base"] = self.base_url
+        try:
+            resp = litellm.embedding(**kwargs)
+        except Exception as exc:
+            logger.warning(
+                f"LLMClient.embed: embedding call failed ({exc}) — caller will "
+                f"skip the embedding-based gate for this run."
+            )
+            return None
+        try:
+            return [item["embedding"] for item in resp.data]
+        except (AttributeError, KeyError, TypeError) as exc:
+            logger.warning(f"LLMClient.embed: unexpected response shape ({exc})")
+            return None
