@@ -185,24 +185,20 @@ class ArxivRetriever(BaseRetriever):
         pid = re.sub(r"v\d+$", "", pid)
         return pid
 
-    def _fetch_affiliations(self, paper_ids: list[str]) -> dict[str, list[str]]:
-        """Query arXiv's Atom API for a batch of papers, return paper_id -> affiliations.
+    def _fetch_arxiv_atom_feed(self, paper_ids: list[str]):
+        """Fetch the arXiv Atom feed for a batch of paper ids.
 
-        arXiv returns per-author `<arxiv:affiliation>` tags when submitters provide
-        them. Much faster and more reliable than LLM-extracting from PDF text, though
-        coverage varies — authors who didn't provide it will simply have no entry.
-
-        Retries on 429 (rate-limit) and transient request errors with exponential
-        backoff — arXiv throttles at ~1 req / 3 s, so a single spike can otherwise
-        lose a whole batch of affiliations.
+        Returns the parsed feedparser feed, or None on persistent failure. Retries
+        on 429 (rate-limit) and transient request errors with exponential backoff —
+        arXiv throttles at ~1 req / 3 s, and bursts can otherwise lose a whole
+        batch.
         """
         if not paper_ids:
-            return {}
+            return None
         id_list = ",".join(paper_ids)
         url = f"http://export.arxiv.org/api/query?id_list={id_list}&max_results={len(paper_ids)}"
-        max_attempts = 4
-        delay = 3.0
-        feed = None
+        max_attempts = 5
+        delay = 5.0
         for attempt in range(1, max_attempts + 1):
             try:
                 # M8: feedparser has no built-in timeout — fetch bytes ourselves
@@ -211,19 +207,20 @@ class ArxivRetriever(BaseRetriever):
                 if resp.status_code == 429:
                     raise requests.HTTPError(f"429 rate-limited (attempt {attempt}/{max_attempts})")
                 resp.raise_for_status()
-                feed = feedparser.parse(resp.content)
-                break
+                return feedparser.parse(resp.content)
             except Exception as exc:
                 if attempt == max_attempts:
-                    logger.warning(f"Affiliation batch fetch failed after {attempt} attempts: {exc}")
-                    return {}
-                logger.debug(f"Affiliation batch attempt {attempt} failed ({exc}); backing off {delay:.1f}s")
+                    logger.warning(f"arXiv Atom fetch failed after {attempt} attempts: {exc}")
+                    return None
+                logger.debug(f"arXiv Atom attempt {attempt} failed ({exc}); backing off {delay:.1f}s")
                 time.sleep(delay)
                 delay *= 2
-        if feed is None:
-            return {}
+        return None
 
+    def _extract_affiliations_from_feed(self, feed) -> dict[str, list[str]]:
         out: dict[str, list[str]] = {}
+        if feed is None:
+            return out
         for entry in feed.entries:
             pid = self._normalize_paper_id(entry.get("id", ""))
             if not pid:
@@ -245,6 +242,33 @@ class ArxivRetriever(BaseRetriever):
             if affs:
                 out[pid] = affs
         return out
+
+    def _fetch_papers_and_affiliations(
+        self, paper_ids: list[str]
+    ) -> tuple[list[ArxivResult], dict[str, list[str]]]:
+        """Fetch ``arxiv.Result`` objects + affiliations for a batch in ONE request.
+
+        Going through the arxiv-py client and then ``_fetch_affiliations`` issues
+        two queries to ``export.arxiv.org`` per batch, which is what trips the
+        429 limiter on a fresh runner. Single-request path uses arxiv-py's own
+        ``Result._from_feed_entry`` to build full Result objects from the same
+        Atom feed we're already parsing for affiliations.
+        """
+        feed = self._fetch_arxiv_atom_feed(paper_ids)
+        if feed is None:
+            return [], {}
+        results: list[ArxivResult] = []
+        for entry in feed.entries:
+            try:
+                results.append(ArxivResult._from_feed_entry(entry))
+            except Exception as exc:
+                logger.debug(f"Failed to parse Atom entry {entry.get('id', '?')}: {exc}")
+        return results, self._extract_affiliations_from_feed(feed)
+
+    def _fetch_affiliations(self, paper_ids: list[str]) -> dict[str, list[str]]:
+        """Affiliations-only convenience wrapper used by fallback paths."""
+        feed = self._fetch_arxiv_atom_feed(paper_ids)
+        return self._extract_affiliations_from_feed(feed)
 
     def _prewarm_affiliations(self, raws: list[ArxivResult]) -> None:
         """Batch-fetch affiliations for a list of raw results and cache them
@@ -328,7 +352,6 @@ class ArxivRetriever(BaseRetriever):
         return sampled
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = _make_arxiv_client(num_retries=10, delay_seconds=10)
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
@@ -341,7 +364,7 @@ class ArxivRetriever(BaseRetriever):
             raise Exception(f"Failed to fetch arXiv RSS feed ({rss_url}): {exc}") from exc
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
+        raw_papers: list[ArxivResult] = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         all_paper_ids = [
             i.id.removeprefix("oai:arXiv.org:")
@@ -351,20 +374,18 @@ class ArxivRetriever(BaseRetriever):
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
+        # One request per 20-paper batch (was two: arxiv-py + _fetch_affiliations),
+        # which previously trippled the 429 limiter on busy days. 5s between
+        # batches respects arXiv's published ~1 req / 3 s budget with margin.
+        batches = [all_paper_ids[i:i + 20] for i in range(0, len(all_paper_ids), 20)]
         bar = tqdm(total=len(all_paper_ids))
-        for i in range(0, len(all_paper_ids), 20):
-            batch_ids = all_paper_ids[i:i + 20]
-            search = arxiv.Search(id_list=batch_ids)
-            batch = list(client.results(search))
-            bar.update(len(batch))
-            raw_papers.extend(batch)
-            # Fetch arXiv-native affiliations for this batch in one go.
-            try:
-                affs = self._fetch_affiliations([self._normalize_paper_id(x) for x in batch_ids])
-                self._affiliations_by_id.update(affs)
-            except Exception as exc:
-                logger.debug(f"Affiliation fetch skipped for batch: {exc}")
+        for idx, batch_ids in enumerate(batches):
+            results, affs = self._fetch_papers_and_affiliations(batch_ids)
+            raw_papers.extend(results)
+            self._affiliations_by_id.update(affs)
+            bar.update(len(batch_ids))
+            if idx < len(batches) - 1:
+                time.sleep(5.0)
         bar.close()
 
         # Optional keyword pre-filter on title + abstract (case-insensitive substring)

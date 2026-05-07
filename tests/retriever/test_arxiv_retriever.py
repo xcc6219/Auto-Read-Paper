@@ -33,36 +33,39 @@ def _raise_runtime_error() -> None:
 
 def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("auto_read_paper.retriever.base.sleep", lambda _: None)
+    # Inter-batch sleep in _retrieve_raw_papers; harmless to skip in tests.
+    monkeypatch.setattr(arxiv_retriever.time, "sleep", lambda _s: None)
 
-    # The RSS fixture gives us paper IDs.  After feedparser, the code calls
-    # arxiv.Client().results(search) which makes real HTTP requests.  We mock
-    # the arxiv Client so the test stays offline.
+    # The RSS fixture gives us paper IDs. _retrieve_raw_papers then calls
+    # _fetch_papers_and_affiliations per 20-id batch (single Atom request that
+    # yields both paper details and affiliations). Stub that method so the
+    # test stays offline; the FakeClient stub on arxiv.Client is no longer
+    # needed because the main path doesn't go through arxiv-py anymore.
     new_entries = [
         e for e in mock_feedparser.entries
         if e.get("arxiv_announce_type", "new") == "new"
     ]
-    paper_ids = [e.id.removeprefix("oai:arXiv.org:") for e in new_entries]
 
-    # Build fake ArxivResult-like objects matching each RSS entry
     fake_results = []
+    fake_results_by_id: dict[str, SimpleNamespace] = {}
     for entry in new_entries:
         pid = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results.append(SimpleNamespace(
+        result = SimpleNamespace(
             title=entry.title,
             authors=[SimpleNamespace(name="Test Author")],
             summary="Test abstract",
             pdf_url=f"https://arxiv.org/pdf/{pid}",
             entry_id=f"https://arxiv.org/abs/{pid}",
             source_url=lambda pid=pid: f"https://arxiv.org/e-print/{pid}",
-        ))
+        )
+        fake_results.append(result)
+        fake_results_by_id[ArxivRetriever._normalize_paper_id(pid)] = result
 
-    class FakeClient:
-        def __init__(self, **kw):
-            pass
-        def results(self, search):
-            return iter(fake_results)
+    def fake_fetch(self, batch_ids):
+        wanted = {ArxivRetriever._normalize_paper_id(b) for b in batch_ids}
+        return [fake_results_by_id[p] for p in wanted if p in fake_results_by_id], {}
 
-    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
+    monkeypatch.setattr(ArxivRetriever, "_fetch_papers_and_affiliations", fake_fetch)
 
     # Skip file downloads in convert_to_paper
     monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
