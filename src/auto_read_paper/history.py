@@ -12,6 +12,7 @@ This keeps old scores when a new version of the same paper is retrieved later.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +21,30 @@ from typing import Optional
 from loguru import logger
 
 from .protocol import Paper
+
+
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_surrogates(obj):
+    """Recursively drop lone UTF-16 surrogates from any string in ``obj``.
+
+    UTF-8 cannot encode unpaired surrogates (U+D800–U+DFFF). Some smaller
+    LLMs occasionally emit broken ``\\uXXXX`` escapes that decode to lone
+    surrogates, and the resulting ``str`` is happily held in memory but
+    explodes on ``json.dump`` with ``UnicodeEncodeError: surrogates not
+    allowed``. Applied at the storage boundary as a belt-and-suspenders
+    pair to the sanitisation already done in :class:`LLMClient`.
+    """
+    if isinstance(obj, str):
+        return _SURROGATE_RE.sub("", obj)
+    if isinstance(obj, dict):
+        return {k: _strip_surrogates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_strip_surrogates(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_strip_surrogates(x) for x in obj)
+    return obj
 
 
 def arxiv_root_id(paper: Paper) -> Optional[str]:
@@ -118,14 +143,33 @@ class ScoreHistory:
                 e["score"] = round(float(e["score"]) * 10.0, 2)
 
     def save(self) -> None:
+        """Atomically persist the in-memory entries to ``self.path``.
+
+        Writes to a sibling ``.tmp`` file first, fsyncs it, then ``os.replace``
+        to swap into place. Avoids the failure mode where an exception mid-
+        ``json.dump`` (e.g. a surrogate UnicodeEncodeError) leaves the real
+        history file truncated to a partial blob, breaking the next ``load``.
+        Strings are run through ``_strip_surrogates`` first so a single
+        malformed LLM output can't poison the whole save.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("w", encoding="utf-8") as f:
+        clean = _strip_surrogates(self.entries)
+        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+        with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(
-                {"papers": self.entries},
+                {"papers": clean},
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                # Fsync isn't available everywhere (some FS / sandboxes);
+                # the rename below is still atomic.
+                pass
+        os.replace(tmp_path, self.path)
         logger.info(f"Saved {len(self.entries)} entries to {self.path}")
 
     def trim(self) -> None:

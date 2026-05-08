@@ -11,6 +11,7 @@ from auto_read_paper.llm_client import (
     _is_reasoning_model,
     _loads_tolerant,
     _normalize_model_name,
+    _strip_surrogates,
     _supports_json_mode,
 )
 
@@ -339,3 +340,31 @@ def test_non_temperature_errors_are_not_swallowed():
 
     assert mock_completion.call_count == 1  # no retry
     assert model_name not in _TEMPERATURE_BLOCKED_MODELS
+
+
+# ---- surrogate sanitization at egress ----------------------------------
+
+
+def test_strip_surrogates_helper():
+    assert _strip_surrogates("hello \ud83d world") == "hello  world"
+    assert _strip_surrogates("clean text") == "clean text"
+    assert _strip_surrogates("") == ""
+    # Paired BMP unicode survives.
+    assert _strip_surrogates("医学图像") == "医学图像"
+
+
+def test_complete_strips_surrogates_from_response():
+    """A small LLM that emits a lone surrogate must not be allowed to
+    poison downstream JSON / SMTP / file writes — sanitize at egress."""
+    c = LLMClient(model="openai/gpt-4o-mini", api_key="sk")
+    poisoned = "[CORE] hello \ud83d world [INNOVATION] x [VALUE] y"
+    fake_resp = MagicMock()
+    fake_resp.choices = [MagicMock(message=MagicMock(content=poisoned))]
+    with patch(
+        "auto_read_paper.llm_client.litellm.completion",
+        return_value=fake_resp,
+    ):
+        out = c.complete(system="s", user="u")
+    assert "\ud83d" not in out
+    # Encoding to UTF-8 succeeds — the actual production failure mode.
+    out.encode("utf-8")

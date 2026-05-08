@@ -45,6 +45,25 @@ _JSON_MODE_PROVIDER_PREFIXES = (
 # max_tokens -> max_completion_tokens, and no temperature/top_p. Covers
 # OpenAI o-series / gpt-5, Moonshot Kimi thinking, DeepSeek-R1, Qwen QwQ,
 # and any provider that puts "-thinking" / "-reasoning" in the model name.
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def _strip_surrogates(text: str) -> str:
+    """Drop lone UTF-16 surrogates from an LLM response.
+
+    Some small / quantised models occasionally emit broken ``\\uXXXX`` escapes
+    that decode to unpaired surrogate code points (U+D800–U+DFFF). Python
+    ``str`` accepts these in memory but UTF-8 cannot encode them, so any
+    downstream JSON dump / SMTP send / file write blows up with
+    ``UnicodeEncodeError: surrogates not allowed``. We strip them at the
+    LLM-egress boundary so the whole codebase below this layer can assume
+    clean Unicode.
+    """
+    if not text:
+        return text
+    return _SURROGATE_RE.sub("", text)
+
+
 _REASONING_MODEL_RE = re.compile(
     r"^(?:[\w.-]+/)?("
     r"o\d[-_]?"                    # openai o1 / o3 / o4
@@ -378,9 +397,10 @@ class LLMClient:
                 raise
         # LiteLLM normalises the response to the OpenAI shape.
         try:
-            return resp.choices[0].message.content or ""
+            content = resp.choices[0].message.content or ""
         except (AttributeError, IndexError):
             return ""
+        return _strip_surrogates(content)
 
     def complete_json(
         self,
