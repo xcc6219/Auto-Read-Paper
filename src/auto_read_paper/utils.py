@@ -144,7 +144,7 @@ def glob_match(path:str, pattern:str) -> bool:
     re_pattern = glob.translate(pattern,recursive=True)
     return re.match(re_pattern, path) is not None
 
-def send_email(config: DictConfig, html: str):
+def send_email(config: DictConfig, html: str, subject: str | None = None):
     sender = config.email.sender
     receiver = config.email.receiver
     password = config.email.sender_password
@@ -165,7 +165,10 @@ def send_email(config: DictConfig, html: str):
     msg['From'] = _format_addr('Github Action <%s>' % sender)
     msg['To'] = _format_addr('You <%s>' % receiver)
     today = datetime.datetime.now().strftime('%Y/%m/%d')
-    msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
+    subject_text = subject if subject else f'Daily arXiv {today}'
+    # Strip CR/LF so a custom subject can't smuggle extra SMTP headers.
+    subject_text = subject_text.replace('\r', ' ').replace('\n', ' ')
+    msg['Subject'] = Header(subject_text, 'utf-8').encode()
 
     # Choose SMTP transport by port instead of the legacy try-TLS-then-fallback
     # chain, which used to leave stray connections behind when the first

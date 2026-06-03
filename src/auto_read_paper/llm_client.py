@@ -118,6 +118,60 @@ def _looks_like_temperature_rejection(exc: BaseException) -> bool:
     )
 
 
+# Markers that identify a FATAL, non-retryable provider failure: the account
+# is out of money / quota. Unlike a 429 rate-limit or a transient 5xx, retrying
+# these never succeeds — every LLM call for the rest of the run is doomed, so
+# the digest ends up empty. We latch the first one process-wide so the
+# orchestrator can email a single "top up your account" notice instead of
+# silently shipping nothing. Markers span provider phrasings (MiniMax
+# "insufficient balance (1008)", DeepSeek "Insufficient Balance", OpenAI
+# "insufficient_quota" / "exceeded your current quota", plus Chinese "余额不足"
+# / "欠费"), so detection is base_url-agnostic.
+_BILLING_ERROR_MARKERS = (
+    "insufficient balance",
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "not enough balance",
+    "billing hard limit",
+    "余额不足",
+    "欠费",
+    "arrears",
+)
+
+# Process-wide latch for the first fatal billing error seen by ANY LLMClient
+# this run. The reranker and the executor each hold their own client, and
+# either may be the one that trips it; a module-level latch gives the executor
+# a single source of truth regardless of which client made the doomed call.
+# Reset once at the start of each Executor.run() so state can't leak across
+# runs in a long-lived process (or between tests).
+_FATAL_BILLING_ERROR: list[str] = []
+
+
+def _looks_like_billing_error(exc: BaseException) -> bool:
+    """True when the provider rejected the call because the account is out of
+    balance / quota — a permanent failure that retrying cannot fix."""
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _BILLING_ERROR_MARKERS)
+
+
+def record_billing_error(message: str) -> None:
+    """Latch the first fatal billing/quota error message (idempotent)."""
+    if message and not _FATAL_BILLING_ERROR:
+        _FATAL_BILLING_ERROR.append(message)
+
+
+def get_billing_error() -> str | None:
+    """Return the latched fatal billing error message this run, or None."""
+    return _FATAL_BILLING_ERROR[0] if _FATAL_BILLING_ERROR else None
+
+
+def reset_billing_error() -> None:
+    """Clear the latch. Called once per run so a previous run's (or test's)
+    billing failure doesn't trigger a spurious notice."""
+    _FATAL_BILLING_ERROR.clear()
+
+
 def _supports_json_mode(model: str) -> bool:
     m = (model or "").lower()
     return any(m.startswith(p) for p in _JSON_MODE_PROVIDER_PREFIXES)
@@ -356,6 +410,19 @@ class LLMClient:
 
         return kwargs
 
+    def _note_billing_error(self, exc: BaseException) -> None:
+        """Latch (process-wide) the first provider 'insufficient balance /
+        quota' failure so the orchestrator can surface a notification email
+        instead of a silently-empty digest. No-op for any other error."""
+        if _looks_like_billing_error(exc) and get_billing_error() is None:
+            logger.error(
+                f"LLMClient: provider reported a fatal billing/quota failure "
+                f"({exc}). Every remaining LLM call this run will fail until "
+                f"the account is topped up — the orchestrator will email a "
+                f"notice instead of an empty digest."
+            )
+            record_billing_error(str(exc))
+
     def complete(
         self,
         *,
@@ -389,11 +456,16 @@ class LLMClient:
                     f"treating as a reasoning model for the rest of this run."
                 )
                 _TEMPERATURE_BLOCKED_MODELS.add(self.model)
-                resp = litellm.completion(
-                    messages=messages,
-                    **self._build_kwargs(json_mode=json_mode),
-                )
+                try:
+                    resp = litellm.completion(
+                        messages=messages,
+                        **self._build_kwargs(json_mode=json_mode),
+                    )
+                except Exception as retry_exc:
+                    self._note_billing_error(retry_exc)
+                    raise
             else:
+                self._note_billing_error(exc)
                 raise
         # LiteLLM normalises the response to the OpenAI shape.
         try:
@@ -490,6 +562,7 @@ class LLMClient:
         try:
             resp = litellm.embedding(**kwargs)
         except Exception as exc:
+            self._note_billing_error(exc)
             logger.warning(
                 f"LLMClient.embed: embedding call failed ({exc}) — caller will "
                 f"skip the embedding-based gate for this run."

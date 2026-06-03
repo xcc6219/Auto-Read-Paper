@@ -342,6 +342,72 @@ def test_non_temperature_errors_are_not_swallowed():
     assert model_name not in _TEMPERATURE_BLOCKED_MODELS
 
 
+# ---- fatal billing-error detection + latch -----------------------------
+
+
+def test_looks_like_billing_error_detection():
+    from auto_read_paper.llm_client import _looks_like_billing_error
+
+    # MiniMax / DeepSeek / OpenAI phrasings + Chinese.
+    assert _looks_like_billing_error(Exception("OpenAIException - insufficient balance (1008)"))
+    assert _looks_like_billing_error(Exception("Error: Insufficient Balance"))
+    assert _looks_like_billing_error(Exception("You exceeded your current quota"))
+    assert _looks_like_billing_error(Exception("error code: insufficient_quota"))
+    assert _looks_like_billing_error(Exception("账户余额不足，无法继续调用"))
+    # Transient / unrelated errors must NOT be treated as fatal billing.
+    assert not _looks_like_billing_error(Exception("429 rate limit exceeded"))
+    assert not _looks_like_billing_error(Exception("503 upstream unavailable"))
+    assert not _looks_like_billing_error(Exception("invalid temperature: only 1 is allowed"))
+
+
+def test_complete_latches_billing_error_and_reraises():
+    from auto_read_paper.llm_client import get_billing_error, reset_billing_error
+
+    reset_billing_error()
+    assert get_billing_error() is None
+
+    c = LLMClient(model="openai/gpt-4o-mini", api_key="sk")
+    boom = Exception("litellm.APIError: OpenAIException - insufficient balance (1008)")
+    with patch("auto_read_paper.llm_client.litellm.completion", side_effect=boom):
+        with pytest.raises(Exception, match="insufficient balance"):
+            c.complete(system="s", user="u")
+
+    latched = get_billing_error()
+    assert latched is not None
+    assert "insufficient balance" in latched.lower()
+    reset_billing_error()
+
+
+def test_complete_does_not_latch_non_billing_error():
+    from auto_read_paper.llm_client import get_billing_error, reset_billing_error
+
+    reset_billing_error()
+    c = LLMClient(model="openai/gpt-4o-mini", api_key="sk")
+    with patch("auto_read_paper.llm_client.litellm.completion",
+               side_effect=RuntimeError("503 upstream unavailable")):
+        with pytest.raises(RuntimeError, match="upstream unavailable"):
+            c.complete(system="s", user="u")
+    assert get_billing_error() is None
+    reset_billing_error()
+
+
+def test_reset_billing_error_clears_latch():
+    from auto_read_paper.llm_client import (
+        get_billing_error,
+        record_billing_error,
+        reset_billing_error,
+    )
+
+    reset_billing_error()
+    record_billing_error("insufficient balance")
+    assert get_billing_error() == "insufficient balance"
+    # First-write-wins: a second record does not overwrite.
+    record_billing_error("something else")
+    assert get_billing_error() == "insufficient balance"
+    reset_billing_error()
+    assert get_billing_error() is None
+
+
 # ---- surrogate sanitization at egress ----------------------------------
 
 

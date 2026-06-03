@@ -1,6 +1,12 @@
 """Tests for auto_read_paper.construct_email: render_email, get_stars, get_block_html."""
 
-from auto_read_paper.construct_email import render_email, get_stars, get_block_html, get_empty_html
+from auto_read_paper.construct_email import (
+    render_email,
+    render_billing_error_email,
+    get_stars,
+    get_block_html,
+    get_empty_html,
+)
 from tests.canned_responses import make_sample_paper
 
 
@@ -80,3 +86,33 @@ def test_get_block_html_contains_all_fields():
 def test_get_empty_html():
     html = get_empty_html()
     assert "No Papers Today" in html
+
+
+def test_render_billing_error_email_chinese():
+    html = render_billing_error_email("OpenAIException - insufficient balance (1008)", "Chinese")
+    assert "余额不足" in html
+    # Raw provider error is surfaced so the user can confirm the cause.
+    assert "insufficient balance (1008)" in html
+    # Recovery instructions point at where to fix it.
+    assert "Settings" in html
+
+
+def test_render_billing_error_email_english():
+    html = render_billing_error_email("insufficient balance", "English")
+    assert "out of balance" in html.lower() or "balance" in html.lower()
+    assert "insufficient balance" in html
+    # No Chinese copy leaks into the English notice body.
+    assert "余额不足" not in html
+
+
+def test_render_billing_error_email_escapes_detail():
+    html = render_billing_error_email("<script>alert(1)</script>", "Chinese")
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_render_billing_error_email_without_detail():
+    # Missing/empty detail still renders a valid notice (no raw-error block).
+    html = render_billing_error_email("", "Chinese")
+    assert "余额不足" in html
+    assert "<code" not in html

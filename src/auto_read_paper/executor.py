@@ -5,10 +5,10 @@ from omegaconf import DictConfig, OmegaConf
 from .retriever import get_retriever_cls
 from .reranker import get_reranker_cls
 from .reranker.keyword_llm import _normalize_keywords, count_keyword_hits
-from .construct_email import render_email
+from .construct_email import render_email, render_billing_error_email
 from .utils import send_email
 from .history import ScoreHistory, _today_iso, _paper_id
-from .llm_client import LLMClient
+from .llm_client import LLMClient, get_billing_error, reset_billing_error
 from .protocol import Paper
 from tqdm import tqdm
 
@@ -215,8 +215,31 @@ class Executor:
                 retention_days=int(hist_cfg.get("retention_days", 7)),
             )
 
+    def _send_billing_notice(self) -> None:
+        """Email an 'LLM account out of balance' notice in lieu of a digest.
+
+        Triggered when a fatal billing/quota error was latched this run and no
+        paper survived to ship. Without it, a depleted account would just send
+        nothing and the user would have no idea why the daily email stopped.
+        """
+        detail = get_billing_error() or ""
+        lang = str(self.config.llm.get("language", "Chinese"))
+        if lang.strip().lower() == "english":
+            subject = "[Auto-Read-Paper] Digest skipped — LLM account out of balance"
+        else:
+            subject = "【Auto-Read-Paper】今日论文未推送 — LLM 余额不足"
+        try:
+            content = render_billing_error_email(detail, lang)
+            send_email(self.config, content, subject=subject)
+            logger.info("Sent insufficient-balance notification email.")
+        except Exception as exc:
+            logger.error(f"Failed to send insufficient-balance notice email: {exc}")
+
     def run(self):
         today = _today_iso()
+        # Fresh latch for this run so a prior run's billing failure (in a
+        # long-lived process) can't trigger a spurious notice.
+        reset_billing_error()
 
         # Surface effective arXiv filter config up-front so users can verify
         # CUSTOM_CONFIG actually took effect (vs silently falling back to the
@@ -463,6 +486,14 @@ class Executor:
                     if self.history is not None:
                         self.history.record_newly_scored(top_papers, today)
 
+        # A fatal billing/quota failure means the LLM account is dry — today's
+        # run can't produce anything. Send a notice instead of silently nothing.
+        if not top_papers and get_billing_error() is not None:
+            self._send_billing_notice()
+            if self.history is not None:
+                self.history.save()
+            return
+
         if not top_papers and not self.config.executor.send_empty:
             logger.info("No unsent papers available — no email will be sent.")
             if self.history is not None:
@@ -543,6 +574,16 @@ class Executor:
         # the cached deep-read content and skips regeneration.
         if self.history is not None:
             self.history.update_generated_fields(top_papers)
+
+        # Same billing guard after the deep-read pass: this is the common case
+        # — reranking fell back to keyword scoring (no LLM needed) so papers
+        # reached deep-read, but every TLDR/title call then failed on the dry
+        # account and all papers were dropped.
+        if not top_papers and get_billing_error() is not None:
+            self._send_billing_notice()
+            if self.history is not None:
+                self.history.save()
+            return
 
         if not top_papers and not self.config.executor.send_empty:
             logger.info("No papers survived the deep-read pass — no email will be sent.")

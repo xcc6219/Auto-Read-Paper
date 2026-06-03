@@ -188,6 +188,89 @@ def _empty_for(lang: str) -> str:
     """
 
 
+# Notice email shown when the run produced no papers because the LLM provider
+# ran out of balance / quota. Bilingual; falls back to English for unknown langs.
+_BILLING_ERROR_TEXT = {
+    "chinese": {
+        "h1": "⚠️ 今日论文未能推送",
+        "sub": "Auto-Read-Paper 运行通知",
+        "title": "LLM 余额不足 / 配额用尽",
+        "body": (
+            "今天的论文摘要没有生成成功：配置的 LLM 服务商在调用时返回了"
+            "「余额不足 / insufficient balance」错误，导致论文评分、深度解读"
+            "和标题翻译全部失败，因此今天没有可推送的论文。"
+        ),
+        "action_label": "如何恢复",
+        "actions": [
+            "前往你的 LLM 服务商后台充值（如 MiniMax / DeepSeek / OpenAI 等）；",
+            "或在 GitHub 仓库 Settings → Secrets and variables → Actions 中，把 "
+            "LLM_API_KEY / LLM_API_BASE / LLM_MODEL 换成其它仍有余额的服务；",
+            "完成后重新触发一次工作流，即可补发今天的论文。",
+        ],
+        "detail_label": "服务商返回的原始错误",
+    },
+    "english": {
+        "h1": "⚠️ Today's digest could not be sent",
+        "sub": "Auto-Read-Paper notification",
+        "title": "LLM account out of balance / quota",
+        "body": (
+            "Today's paper summaries were not generated: the configured LLM "
+            "provider returned an \"insufficient balance\" error on every call, "
+            "so scoring, deep-read and title translation all failed and no "
+            "papers could be shipped today."
+        ),
+        "action_label": "How to recover",
+        "actions": [
+            "Top up your LLM provider account (e.g. MiniMax / DeepSeek / OpenAI);",
+            "or swap LLM_API_KEY / LLM_API_BASE / LLM_MODEL under the GitHub repo "
+            "Settings → Secrets and variables → Actions for a provider that still "
+            "has balance;",
+            "then re-trigger the workflow to resend today's digest.",
+        ],
+        "detail_label": "Raw provider error",
+    },
+}
+
+
+def render_billing_error_email(detail: str = "", lang: str = "Chinese") -> str:
+    """Render a notice email explaining that the LLM account is out of balance.
+
+    Sent in place of the daily digest when a fatal insufficient-balance/quota
+    error left the run with no papers to ship — so the user finds out the
+    account dried up instead of silently receiving nothing.
+    """
+    key = (lang or "chinese").strip().lower()
+    t = _BILLING_ERROR_TEXT.get(key, _BILLING_ERROR_TEXT["english"])
+    header = (
+        '<div class="digest-header" '
+        'style="background: linear-gradient(135deg, #dc2626 0%, #d97706 100%);">'
+        f'<h1>{t["h1"]}</h1>'
+        f'<div class="sub">{t["sub"]}</div>'
+        '</div>'
+    )
+    actions_html = "".join(f"<li>{_html.escape(a)}</li>" for a in t["actions"])
+    detail_html = ""
+    if detail and detail.strip():
+        safe = _html.escape(detail.strip())
+        detail_html = (
+            '<div class="paper-meta" style="margin-top:14px;">'
+            f'<b>{_html.escape(t["detail_label"])}</b><br>'
+            '<code style="display:block; background:#f3f4f6; padding:10px; '
+            'border-radius:6px; color:#b91c1c; word-break:break-all; '
+            f'margin-top:6px;">{safe}</code></div>'
+        )
+    card = (
+        '<div class="paper-card" style="border-left-color:#dc2626;">'
+        f'<div class="paper-title-en">{_html.escape(t["title"])}</div>'
+        f'<div class="section" style="margin-top:10px;">{_html.escape(t["body"])}</div>'
+        f'<div class="section" style="margin-top:10px;"><b>{_html.escape(t["action_label"])}</b>'
+        f'<ol style="margin:8px 0 0 18px; padding:0; line-height:1.7;">{actions_html}</ol></div>'
+        f'{detail_html}'
+        '</div>'
+    )
+    return framework.replace("__CONTENT__", header + card)
+
+
 def render_email(papers: list[Paper], lang: str = "Chinese") -> str:
     header = _header_for(lang)
 
