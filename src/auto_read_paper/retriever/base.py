@@ -7,6 +7,18 @@ from time import sleep
 from loguru import logger
 
 
+class RetrieverFetchError(Exception):
+    """A retriever could not reach its upstream source (transient network
+    failure: timeout, connection reset, 5xx, ...).
+
+    Distinct from a configuration error (e.g. an invalid arXiv category) so the
+    orchestrator can degrade gracefully — fall back to the unsent history pool
+    instead of crashing the whole run — when a source has a momentary outage.
+    Configuration errors deliberately stay as plain exceptions so they keep
+    failing loudly.
+    """
+
+
 class BaseRetriever(ABC):
     name: str
     def __init__(self, config:DictConfig):

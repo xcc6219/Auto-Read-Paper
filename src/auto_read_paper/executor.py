@@ -3,6 +3,7 @@ import math
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from .retriever import get_retriever_cls
+from .retriever.base import RetrieverFetchError
 from .reranker import get_reranker_cls
 from .reranker.keyword_llm import _normalize_keywords, count_keyword_hits
 from .construct_email import render_email, render_billing_error_email
@@ -258,7 +259,18 @@ class Executor:
         all_papers = []
         for source, retriever in self.retrievers.items():
             logger.info(f"Retrieving {source} papers...")
-            papers = retriever.retrieve_papers()
+            try:
+                papers = retriever.retrieve_papers()
+            except RetrieverFetchError as exc:
+                # Transient upstream outage (e.g. arXiv RSS read timeout). Don't
+                # crash the run — skip this source and fall through to the
+                # history pool / fallbacks so the daily email can still ship
+                # yesterday's unsent backlog.
+                logger.warning(
+                    f"Source {source!r} unreachable this run ({exc}); "
+                    f"continuing with history pool / fallbacks."
+                )
+                continue
             if len(papers) == 0:
                 logger.info(f"No {source} papers found")
                 continue

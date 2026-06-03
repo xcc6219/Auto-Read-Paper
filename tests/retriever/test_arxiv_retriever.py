@@ -79,6 +79,33 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     assert set(p.title for p in papers) == set(e.title for e in new_entries)
 
 
+def test_rss_fetch_raises_retriever_fetch_error_after_retries(config, monkeypatch):
+    """A persistent RSS network failure should retry, then raise
+    RetrieverFetchError (so the executor can degrade to the history pool) —
+    not a bare Exception, and not after a single attempt."""
+    import requests
+
+    from auto_read_paper.retriever.base import RetrieverFetchError
+
+    # No real backoff sleeping between retries.
+    monkeypatch.setattr(arxiv_retriever.time, "sleep", lambda _s: None)
+
+    calls = {"n": 0}
+
+    def always_timeout(url, **kwargs):
+        calls["n"] += 1
+        raise requests.exceptions.ReadTimeout("read timed out")
+
+    monkeypatch.setattr(requests, "get", always_timeout)
+
+    retriever = ArxivRetriever(config)
+    with pytest.raises(RetrieverFetchError) as excinfo:
+        retriever._retrieve_raw_papers()
+
+    assert "Failed to fetch arXiv RSS feed" in str(excinfo.value)
+    assert calls["n"] == 4  # retried up to max_attempts, not just once
+
+
 @_skip_on_windows
 def test_run_with_hard_timeout_returns_value():
     result = _run_with_hard_timeout(

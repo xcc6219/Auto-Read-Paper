@@ -1,4 +1,4 @@
-from .base import BaseRetriever, register_retriever
+from .base import BaseRetriever, RetrieverFetchError, register_retriever
 import arxiv
 from arxiv import Result as ArxivResult
 from ..protocol import Paper
@@ -354,14 +354,38 @@ class ArxivRetriever(BaseRetriever):
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         query = '+'.join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
+        # Get the latest paper from arxiv rss feed. rss.arxiv.org occasionally
+        # stalls from CI runners, so retry transient failures with exponential
+        # backoff before giving up — a single 30s read timeout shouldn't crash
+        # the whole daily run. On persistent failure we raise RetrieverFetchError
+        # (not a bare Exception) so the executor can degrade to the history pool
+        # rather than aborting the job.
         rss_url = f"https://rss.arxiv.org/atom/{query}"
-        try:
-            rss_resp = requests.get(rss_url, timeout=(10, 30))
-            rss_resp.raise_for_status()
-            feed = feedparser.parse(rss_resp.content)
-        except Exception as exc:
-            raise Exception(f"Failed to fetch arXiv RSS feed ({rss_url}): {exc}") from exc
+        feed = None
+        last_exc: Exception | None = None
+        max_attempts = 4
+        delay = 5.0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                rss_resp = requests.get(rss_url, timeout=(10, 60))
+                rss_resp.raise_for_status()
+                feed = feedparser.parse(rss_resp.content)
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt == max_attempts:
+                    break
+                logger.warning(
+                    f"arXiv RSS fetch attempt {attempt}/{max_attempts} failed "
+                    f"({exc}); retrying in {delay:.0f}s"
+                )
+                time.sleep(delay)
+                delay *= 2
+        if feed is None:
+            raise RetrieverFetchError(
+                f"Failed to fetch arXiv RSS feed ({rss_url}) after "
+                f"{max_attempts} attempts: {last_exc}"
+            ) from last_exc
         if 'Feed error for query' in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers: list[ArxivResult] = []
